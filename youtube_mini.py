@@ -1005,9 +1005,17 @@ class Api:
             self._window.destroy()
         except Exception:
             pass
+
         # 창 파괴 후에도 백그라운드 스레드(주입 루프 등)가 프로세스를
-        # 붙잡아 좀비로 남지 않게 — 잠시 후 무조건 프로세스 종료
-        t = threading.Timer(1.5, os._exit, args=(0,))
+        # 붙잡아 좀비로 남지 않게 — 잠시 후 무조건 프로세스 종료.
+        # 종료 직전 WebView2 자식을 먼저 정리해 프로필/임시폴더 잠금을 풀어야
+        # (1) PyInstaller 의 '_MEI 임시폴더 삭제 실패' 경고와
+        # (2) 다음 실행의 프로필 잠금(엔진 초기화 실패)을 막을 수 있다.
+        def _final_exit():
+            _kill_descendants()
+            os._exit(0)
+
+        t = threading.Timer(1.5, _final_exit)
         t.daemon = True
         t.start()
 
@@ -1260,9 +1268,21 @@ class Api:
             native = getattr(self._menu, "native", None)
             if native is not None and hasattr(native, "BeginInvoke"):
                 import System  # pythonnet (Windows)
-                native.BeginInvoke(
-                    System.Action(lambda: setattr(native, "ShowInTaskbar", False))
-                )
+
+                def _apply():
+                    try:
+                        native.ShowInTaskbar = False
+                    except Exception:
+                        pass
+                    # WebView2 가 첫 페인트 전이라도 흰 배경 대신 메뉴와 같은
+                    # 어두운 배경이 보이게 한다 (첫 실행 시 흰 화면 방지)
+                    try:
+                        from System.Drawing import Color
+                        native.BackColor = Color.FromArgb(30, 30, 30)
+                    except Exception:
+                        pass
+
+                native.BeginInvoke(System.Action(_apply))
         except Exception as e:
             _log_file("menu_no_taskbar failed: %r" % (e,))
 
@@ -1311,37 +1331,49 @@ class Api:
         if self._menu is None or self._menu not in webview.windows:
             _log_file("show_menu: menu window unavailable")
             return
-        if not self._menu_ok:
-            _log_file("show_menu: menu page not loaded yet (WebView2 init?)")
+        self._menu_open = True
         try:
             x, y = self._menu_pos(int(sx), int(sy))
-            self._menu_open = True
-            # 메뉴 창을 '먼저' 표시하고 상태(재생/음소거 등) 갱신은
-            # 백그라운드로 미룬다. evaluate_js 는 대상 창의 loaded 가
-            # 안 왔거나 내비게이션 중이면 무기한 블로킹될 수 있는데,
-            # 예전엔 그게 이 함수 안에서 먼저 실행돼 메뉴 창이 초기화에
-            # 실패한 세션에서는 우클릭이 영영 안 먹혔다.
+        except Exception:
+            x, y = int(sx), int(sy)
+
+        def _reveal():
+            # 메뉴 WebView2 가 아직 로드(첫 페인트) 전이면 화면 안으로 옮겨도
+            # 내용이 안 그려진 '흰(빈) 창'이 뜬다. 첫 실행에서 이 증상이 잦아
+            # loaded 신호(_menu_ok)를 잠깐 기다렸다가 표시한다. 이미 로드된
+            # 뒤(두 번째부터)엔 대기 없이 즉시 뜬다.
+            deadline = time.time() + 2.5
+            while (not self._menu_ok and self._menu_open
+                   and time.time() < deadline):
+                time.sleep(0.05)
+            if not self._menu_open:      # 대기 중 토글로 닫힘
+                return
+            if not self._menu_ok:
+                _log_file("show_menu: menu page not loaded yet (WebView2 init?)")
             # 창은 항상 '표시' 상태 — 커서 위치로 이동시키는 것만으로 나타난다.
             # (위치+크기+최상위+표시를 SetWindowPos 한 번으로, 포커스 안 뺏음)
-            u = _user32()
-            mh = self._hwnd_of(self._menu)
-            if u is not None and mh:
-                u.SetWindowPos(mh, HWND_TOPMOST, x, y, self._menu_w, self._menu_h,
-                               SWP_NOACTIVATE | SWP_SHOWWINDOW)
-            else:
-                try:
-                    self._menu.resize(self._menu_w, self._menu_h)
-                except Exception:
-                    pass
-                self._menu.move(x, y)
-            t = threading.Thread(target=self._push_menu_state, daemon=True)
-            t.start()
-            # 바깥 클릭 감시 시작 (마우스 이동만으로는 닫히지 않음)
-            t = threading.Thread(target=self._menu_outside_watch, daemon=True)
-            t.start()
-        except Exception as e:
-            self._menu_open = False
-            _log_file("show_menu failed: %r" % (e,))
+            try:
+                u = _user32()
+                mh = self._hwnd_of(self._menu)
+                if u is not None and mh:
+                    u.SetWindowPos(mh, HWND_TOPMOST, x, y,
+                                   self._menu_w, self._menu_h,
+                                   SWP_NOACTIVATE | SWP_SHOWWINDOW)
+                else:
+                    try:
+                        self._menu.resize(self._menu_w, self._menu_h)
+                    except Exception:
+                        pass
+                    self._menu.move(x, y)
+            except Exception as e:
+                _log_file("show_menu reveal failed: %r" % (e,))
+            # 상태(재생/음소거 등) 갱신 + 바깥 클릭 감시는 별도 스레드로.
+            # evaluate_js 는 대상 창 로드 전/내비게이션 중 블로킹될 수 있어
+            # 표시 경로와 분리한다.
+            threading.Thread(target=self._push_menu_state, daemon=True).start()
+            threading.Thread(target=self._menu_outside_watch, daemon=True).start()
+
+        threading.Thread(target=_reveal, daemon=True).start()
 
     def _push_menu_state(self):
         """현재 상태를 수집해 메뉴 페이지에 반영 (백그라운드 전용).
@@ -1835,6 +1867,143 @@ class Api:
             pass
 
 
+# ---- 자식 프로세스(WebView2) 정리 ----
+# PyInstaller onefile 은 종료 시 _MEIxxxx 임시폴더를 지운다. 이때 살아 있는
+# WebView2(msedgewebview2.exe) 자식이 그 폴더의 핸들을 쥐고 있으면 삭제가
+# 실패해 'Failed to remove temporary directory' 경고가 뜬다. 또 이 자식들이
+# WebView2 프로필(EBWebView)을 잠근 채 남으면 다음 실행이 엔진 초기화에
+# 실패(0x8007139F 등)해 '복구 후 재시작' 루프에 빠진다. 종료·재시작 전에
+# 반드시 정리해야 두 증상이 모두 사라진다.
+
+TH32CS_SNAPPROCESS = 0x00000002
+PROCESS_TERMINATE = 0x0001
+
+
+class _PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.c_void_p),
+        ("th32ModuleID", wintypes.DWORD),
+        ("cntThreads", wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", wintypes.DWORD),
+        ("szExeFile", ctypes.c_wchar * 260),
+    ]
+
+
+_K32 = None
+
+
+def _kernel32_ex():
+    """toolhelp/OpenProcess 전용 kernel32 인스턴스.
+
+    _user32() 와 같은 이유로 프로세스 공유 windll.kernel32 에 시그니처를
+    설정하면 다른 코드(pywebview 등)의 호출이 깨질 수 있어 별도 인스턴스에
+    argtypes/restype 를 격리한다. Windows 가 아니면 None.
+    """
+    global _K32
+    if _K32 is not None:
+        return _K32
+    if not hasattr(ctypes, "WinDLL"):
+        return None
+    try:
+        k = ctypes.WinDLL("kernel32")
+    except Exception:
+        return None
+    try:
+        k.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+        k.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        k.Process32FirstW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_PROCESSENTRY32W)]
+        k.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_PROCESSENTRY32W)]
+        k.CloseHandle.argtypes = [ctypes.c_void_p]
+        k.OpenProcess.restype = ctypes.c_void_p
+        k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    except Exception:
+        return None
+    _K32 = k
+    return k
+
+
+def _descendant_procs(root_pid):
+    """root_pid 의 모든 하위(자식·손자…) 프로세스를 (pid, exe소문자) 로 반환."""
+    k = _kernel32_ex()
+    if k is None:
+        return []
+    snap = k.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snap or snap == ctypes.c_void_p(-1).value:
+        return []
+    procs = []   # (pid, ppid, name)
+    try:
+        pe = _PROCESSENTRY32W()
+        pe.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+        if not k.Process32FirstW(snap, ctypes.byref(pe)):
+            return []
+        while True:
+            procs.append((pe.th32ProcessID, pe.th32ParentProcessID,
+                          (pe.szExeFile or "").lower()))
+            if not k.Process32NextW(snap, ctypes.byref(pe)):
+                break
+    except Exception:
+        return []
+    finally:
+        try:
+            k.CloseHandle(snap)
+        except Exception:
+            pass
+    children = {}
+    name_of = {}
+    for pid, ppid, name in procs:
+        children.setdefault(ppid, []).append(pid)
+        name_of[pid] = name
+    result, stack, seen = [], [root_pid], set()
+    while stack:
+        p = stack.pop()
+        for c in children.get(p, ()):
+            if c and c != root_pid and c not in seen:
+                seen.add(c)
+                result.append((c, name_of.get(c, "")))
+                stack.append(c)
+    return result
+
+
+def _has_webview_children():
+    """WebView2 자식이 살아 있는지 — 초기화가 '진행 중'인지 판별용."""
+    try:
+        return any(n == "msedgewebview2.exe"
+                   for _pid, n in _descendant_procs(os.getpid()))
+    except Exception:
+        return False
+
+
+def _kill_descendants(names=("msedgewebview2.exe",)):
+    """현재 프로세스의 WebView2 자식을 종료해 프로필/임시폴더 잠금을 푼다.
+
+    names=None 이면 모든 하위 프로세스를 종료. 기본은 WebView2 만 골라
+    다른 프로그램에 영향이 없게 한다.
+    """
+    k = _kernel32_ex()
+    if k is None:
+        return
+    want = set(n.lower() for n in names) if names else None
+    try:
+        for pid, name in _descendant_procs(os.getpid()):
+            if want is not None and name not in want:
+                continue
+            try:
+                h = k.OpenProcess(PROCESS_TERMINATE, False, pid)
+                if h:
+                    k.TerminateProcess(h, 0)
+                    k.CloseHandle(h)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 _MUTEX = None
 
 
@@ -1873,29 +2042,28 @@ def _single_instance():
                                    | SWP_SHOWWINDOW)
                 _log_file("already running - user kept old instance")
                 return False
-            # 예 → 기존 프로세스 종료 후 계속 실행
+            # 예 → 기존 프로세스를 '트리째' 종료 후 계속 실행.
+            # /T 로 자식(WebView2 msedgewebview2.exe)까지 함께 종료해야
+            # 새 인스턴스가 프로필 잠금에 걸려 다시 흰 창이 되는 것을 막는다.
+            import subprocess
             killed = False
             if hwnd:
                 pid = wintypes.DWORD(0)
                 u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
                 if pid.value and pid.value != os.getpid():
-                    kk = ctypes.WinDLL("kernel32")
-                    kk.OpenProcess.restype = ctypes.c_void_p
-                    ph = kk.OpenProcess(0x0001, False, pid.value)  # PROCESS_TERMINATE
-                    if ph:
-                        kk.TerminateProcess(ph, 0)
-                        kk.CloseHandle(ph)
-                        killed = True
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(pid.value)],
+                        creationflags=0x08000000, check=False)  # CREATE_NO_WINDOW
+                    killed = True
             if not killed and getattr(sys, "frozen", False):
-                # 창 없는 좀비 exe 정리 (자기 자신 제외)
-                import subprocess
+                # 창 없는 좀비 exe 정리 (자기 자신 제외) — 트리째
                 subprocess.run(
-                    ["taskkill", "/F", "/FI", "IMAGENAME eq YTMini.exe",
+                    ["taskkill", "/F", "/T", "/FI", "IMAGENAME eq YTMini.exe",
                      "/FI", "PID ne %d" % os.getpid()],
                     creationflags=0x08000000, check=False)  # CREATE_NO_WINDOW
                 killed = True
-            _log_file("already running - killed old instance: %s" % killed)
-            time.sleep(1.2)   # WebView2 자식 프로세스/프로필 잠금 정리 대기
+            _log_file("already running - killed old instance tree: %s" % killed)
+            time.sleep(1.5)   # WebView2 자식 프로세스/프로필 잠금 정리 대기
             return True
         except Exception as e:
             _log_file("single_instance takeover failed: %r" % (e,))
@@ -1954,12 +2122,17 @@ def _hide_own_console():
 def _relaunch():
     """뮤텍스를 풀고 자기 자신을 새 프로세스로 재실행."""
     global _MUTEX
+    # 먼저 WebView2 자식을 정리한다 — 살아 있으면 EBWebView 프로필을 잠근
+    # 채 남아 새 인스턴스의 엔진 초기화도 실패시켜 무한 재시작 루프가 된다
+    # (스크린샷의 '이미 실행 중'+'임시폴더 삭제 실패' 연쇄 증상의 근본 원인).
+    _kill_descendants()
     try:
         if _MUTEX:
             ctypes.windll.kernel32.CloseHandle(_MUTEX)
             _MUTEX = None
     except Exception:
         pass
+    time.sleep(1.0)   # 자식 프로세스가 완전히 내려가 프로필 잠금이 풀릴 때까지
     import subprocess
     try:
         if getattr(sys, "frozen", False):
@@ -1974,7 +2147,20 @@ def _relaunch():
 def _engine_watchdog(api):
     """WebView2 초기화 실패(0x8007139F 등 → loaded 이벤트가 영영 안 옴)를
     감지해 엔진 프로필(EBWebView)을 초기화하고 자동 재시작한다."""
-    time.sleep(20)
+    # 콜드 스타트(첫 실행)/느린 PC 는 20초를 넘길 수 있어 우선 넉넉히 기다린다.
+    for _ in range(20):
+        time.sleep(1)
+        if api._engine_ok:
+            break
+    # 아직이면: WebView2 자식이 살아 있으면 초기화가 '진행 중'이라는 뜻 —
+    # 프로필을 지우고 재시작하는 대신 조금 더 기다린다 (건강한 느린 실행을
+    # 오탐으로 날려 재시작 루프에 빠지는 것을 막는다).
+    if not api._engine_ok and _has_webview_children():
+        _log_file("engine watchdog: 20s 경과했지만 WebView2 자식 살아있음 — 대기 연장")
+        for _ in range(25):
+            time.sleep(1)
+            if api._engine_ok:
+                break
     if api._engine_ok:
         # 미니(영상)는 정상인데 팝업 메뉴 창만 초기화에 실패한 경우 —
         # 우클릭해도 메뉴가 안 나오는 간헐 증상. 그대로 두면 재시작
@@ -2186,6 +2372,90 @@ def _keep_mini_injected(api):
         time.sleep(2)
 
 
+def _bundled_dll_candidates(dll_name):
+    """번들/설치 트리에서 dll_name 을 모두 찾아 경로 목록으로 반환."""
+    roots = []
+    mp = getattr(sys, "_MEIPASS", None)
+    if mp:
+        roots.append(mp)
+    try:
+        roots.append(os.path.dirname(os.path.abspath(webview.__file__)))
+    except Exception:
+        pass
+    found, seen = [], set()
+    for root in roots:
+        if not root or root in seen:
+            continue
+        seen.add(root)
+        try:
+            for dirpath, _dirs, files in os.walk(root):
+                if dll_name in files:
+                    found.append(os.path.join(dirpath, dll_name))
+        except Exception:
+            pass
+    return found
+
+
+def _patch_pywebview_arch():
+    """Windows on ARM 대응.
+
+    pywebview 는 platform.machine()==ARM64 이면 win-arm64 인터롭 DLL 을
+    찾는데, x64 로 빌드한 exe 를 ARM Windows 에서 에뮬레이션 실행하면 그
+    폴더가 없어 'Cannot find win-arm64' 로 임포트 단계에서 죽는다
+    (webview.util.interop_dll_path). WebView2 는 x64 에뮬레이션에서 정상
+    동작하므로 번들된 x64 DLL 을 대신 쓰게 한다. edgechromium 모듈이
+    임포트되기 전(webview.start 전)에 호출해야 효과가 있다.
+    """
+    try:
+        from webview import util as _wvutil
+    except Exception:
+        return
+    orig = getattr(_wvutil, "interop_dll_path", None)
+    if orig is None or getattr(orig, "_arch_patched", False):
+        return
+
+    def interop_dll_path(dll_name):
+        try:
+            p = orig(dll_name)
+            if p and os.path.exists(p):
+                return p
+        except Exception as e:
+            _log_file("interop_dll_path 원본 실패(%s): %r" % (dll_name, e))
+        cands = _bundled_dll_candidates(dll_name)
+        # 네이티브 로더(WebView2Loader.dll)는 아키텍처별이라 '실제 이 프로세스가
+        # 도는 아키텍처'에 맞춰 고른다. ARM Windows 에서 x64 로 빌드된 exe 는
+        # 에뮬레이션이라 PROCESSOR_ARCHITECTURE 가 AMD64 → x64 사본을 쓴다.
+        # 관리형(.NET) 어셈블리는 AnyCPU 라 아무 사본이나 무방하다.
+        pa = (os.environ.get("PROCESSOR_ARCHITECTURE") or "").lower()
+        if "arm" in pa:
+            prefer = ("arm64",)
+        elif pa == "x86":
+            prefer = ("x86",)
+        else:
+            prefer = ("x64", "amd64")
+        for cand in cands:
+            if any(k in cand.lower() for k in prefer):
+                _log_file("interop_dll_path: %s -> %s 대체 %s"
+                          % (dll_name, prefer[0], cand))
+                return cand
+        # 선호 아키텍처가 없으면 x64 를 마지막 후보로 (에뮬레이션 호환)
+        for cand in cands:
+            low = cand.lower()
+            if "arm64" not in low and any(k in low for k in ("x64", "amd64")):
+                _log_file("interop_dll_path: %s -> x64 대체 %s" % (dll_name, cand))
+                return cand
+        if cands:
+            _log_file("interop_dll_path: %s -> 대체 %s" % (dll_name, cands[0]))
+            return cands[0]
+        return orig(dll_name)   # 최후엔 원래 예외를 그대로 전파
+
+    interop_dll_path._arch_patched = True
+    try:
+        _wvutil.interop_dll_path = interop_dll_path
+    except Exception:
+        pass
+
+
 def main():
     # 중복 실행이면 종료 — 두 인스턴스가 같은 WebView2 프로필을 잡으면
     # 두 번째가 0x8007139F(컨트롤러 생성 실패)로 흰 창만 뜬다.
@@ -2213,16 +2483,28 @@ def main():
         "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
         "--autoplay-policy=no-user-gesture-required",
     )
+    # ARM Windows(에뮬레이션 실행)에서 win-arm64 인터롭 DLL 을 못 찾아
+    # webview.start 가 죽는 문제 방지 — 반드시 창 생성/start 전에 적용
+    _patch_pywebview_arch()
 
     cfg = load_config()
     # 지난 실행에서 엔진 초기화 실패로 프로필 복구가 예약된 경우:
-    # 이전 프로세스(웹뷰 포함)가 완전히 내려간 뒤 엔진 데이터만 삭제
+    # 이전 프로세스(웹뷰 포함)가 완전히 내려간 뒤 엔진 데이터만 삭제.
+    # 이전 인스턴스의 WebView2 자식이 늦게 내려가 프로필이 잠겨 있으면
+    # 한 번의 rmtree 는 조용히 실패하므로(ignore_errors) 몇 번 재시도한다.
     if cfg.pop("resetUdf", False):
-        time.sleep(1.5)
         import shutil
-        shutil.rmtree(os.path.join(PROFILE_DIR, "EBWebView"), ignore_errors=True)
+        target = os.path.join(PROFILE_DIR, "EBWebView")
+        removed = False
+        for _ in range(6):
+            time.sleep(1.0)
+            shutil.rmtree(target, ignore_errors=True)
+            if not os.path.exists(target):
+                removed = True
+                break
         save_config(cfg)
-        _log_file("EBWebView profile reset done")
+        _log_file("EBWebView profile reset %s"
+                  % ("done" if removed else "FAILED (프로필 잠금 지속)"))
     start_url = cfg.get("lastUrl") or DEFAULT_URL
     # 마지막 재생 위치에서 이어보기 (2초 여유를 두고 되감기)
     last_t = int(cfg.get("lastTime", 0) or 0)
@@ -2269,11 +2551,13 @@ def main():
     webview.start(_keep_mini_injected, (api,), private_mode=False, storage_path=PROFILE_DIR)
 
     # GUI 루프 종료(모든 창 닫힘) 후: 남은 백그라운드 스레드와 무관하게
-    # 프로세스를 확실히 종료해 좀비(뮤텍스 잔류 → '이미 실행 중' 팝업) 방지
+    # 프로세스를 확실히 종료해 좀비(뮤텍스 잔류 → '이미 실행 중' 팝업) 방지.
+    # 종료 전 WebView2 자식을 정리해 _MEI 임시폴더 삭제 실패 경고를 막는다.
     try:
         save_config(api._config)
     except Exception:
         pass
+    _kill_descendants()
     os._exit(0)
 
 
