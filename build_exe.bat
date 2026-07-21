@@ -25,6 +25,13 @@ if errorlevel 1 (
     if errorlevel 1 goto fail
 )
 
+REM --- Show which WebView2 interop DLLs pywebview provides -------------
+REM  If this list is empty, the exe will NOT be able to start WebView2
+REM  ("Cannot find win-arm64" / init failure). Reinstall pywebview.
+echo.
+echo Checking bundled WebView2 DLLs in the installed pywebview...
+python -c "import os,webview;base=os.path.join(os.path.dirname(webview.__file__),'lib');[print('   ',os.path.relpath(os.path.join(r,f),base)) for r,d,fs in os.walk(base) for f in fs if f.lower().endswith('.dll') and ('webview2' in f.lower())]" 2>nul
+
 set ICON_OPTS=
 if exist icon.ico (
     set ICON_OPTS=--icon icon.ico --add-data "icon.ico;."
@@ -33,9 +40,14 @@ if exist icon.ico (
     echo       Copy icon.ico next to this file to use the custom icon.
 )
 
+REM  --collect-all pulls in every pywebview data/binary file (all arch
+REM  WebView2 loaders). --collect-binaries is added explicitly so the
+REM  native WebView2Loader.dll copies are never skipped by data-only
+REM  collection. The running app also self-heals arch mismatches
+REM  (x64 build under ARM emulation) at startup.
 echo.
 echo Building YTMini.exe ...
-python -m PyInstaller --onefile --noconsole --clean --name YTMini %ICON_OPTS% --hidden-import webview.platforms.winforms --hidden-import webview.platforms.edgechromium --collect-all webview youtube_mini.py
+python -m PyInstaller --onefile --noconsole --clean --name YTMini %ICON_OPTS% --hidden-import webview.platforms.winforms --hidden-import webview.platforms.edgechromium --collect-all webview --collect-binaries webview youtube_mini.py
 if errorlevel 1 goto fail
 
 echo.

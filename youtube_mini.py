@@ -2028,6 +2028,38 @@ def _kill_descendants(names=("msedgewebview2.exe",)):
         pass
 
 
+def _kill_profile_lockers():
+    """이전 실행이 비정상 종료돼 남은, 우리 프로필을 잠근 WebView2 프로세스 정리.
+
+    이런 프로세스(msedgewebview2.exe)가 EBWebView 프로필을 물고 있으면 새
+    실행의 엔진 초기화가 실패해 '프로필 복구 후 재시작'이 반복된다. 명령줄에
+    우리 프로필 폴더명(.yt_mini_profile)이 든 것만 골라 종료하므로 다른 앱의
+    WebView2 는 건드리지 않는다.
+
+    주의: 반드시 우리 WebView2 가 뜨기 전(webview.start 이전)에 호출할 것 —
+    안 그러면 자기 자신의 엔진 프로세스까지 죽인다.
+    """
+    if not sys.platform.startswith("win"):
+        return
+    name = os.path.basename(PROFILE_DIR)         # 예: .yt_mini_profile
+    safe = name.replace("'", "''")
+    ps = (
+        "Get-CimInstance Win32_Process -Filter \"Name='msedgewebview2.exe'\" "
+        "| Where-Object { $_.CommandLine -like '*%s*' } "
+        "| ForEach-Object { Stop-Process -Id $_.ProcessId -Force "
+        "-ErrorAction SilentlyContinue }"
+    ) % safe
+    try:
+        import subprocess
+        subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            creationflags=0x08000000, timeout=20, check=False)  # CREATE_NO_WINDOW
+        _log_file("kill_profile_lockers: 남은 WebView2 잠금 프로세스 정리 시도 (%s)"
+                  % name)
+    except Exception as e:
+        _log_file("kill_profile_lockers failed: %r" % (e,))
+
+
 _MUTEX = None
 
 
@@ -2171,20 +2203,20 @@ def _relaunch():
 def _engine_watchdog(api):
     """WebView2 초기화 실패(0x8007139F 등 → loaded 이벤트가 영영 안 옴)를
     감지해 엔진 프로필(EBWebView)을 초기화하고 자동 재시작한다."""
-    # 콜드 스타트(첫 실행)/느린 PC 는 20초를 넘길 수 있어 우선 넉넉히 기다린다.
-    for _ in range(20):
+    # 콜드 스타트(첫 실행)/느린 PC(특히 ARM 에뮬레이션)는 30초를 넘길 수 있어
+    # 우선 넉넉히 기다린다.
+    for _ in range(30):
         time.sleep(1)
         if api._engine_ok:
             break
     # 아직이면: WebView2 자식이 살아 있으면 초기화가 '진행 중'이라는 뜻 —
-    # 프로필을 지우고 재시작하는 대신 조금 더 기다린다 (건강한 느린 실행을
-    # 오탐으로 날려 재시작 루프에 빠지는 것을 막는다).
-    if not api._engine_ok and _has_webview_children():
-        _log_file("engine watchdog: 20s 경과했지만 WebView2 자식 살아있음 — 대기 연장")
-        for _ in range(25):
-            time.sleep(1)
-            if api._engine_ok:
-                break
+    # 프로필을 지우고 재시작하는 대신, 자식이 살아 있는 한 최대 120초까지
+    # 더 기다린다 (건강하지만 느린 실행을 오탐으로 날려 재시작 루프에 빠지는
+    # 것을 막는다).
+    waited = 30
+    while not api._engine_ok and waited < 120 and _has_webview_children():
+        time.sleep(2)
+        waited += 2
     if api._engine_ok:
         # 미니(영상)는 정상인데 팝업 메뉴 창만 초기화에 실패한 경우 —
         # 우클릭해도 메뉴가 안 나오는 간헐 증상. 그대로 두면 재시작
@@ -2396,8 +2428,7 @@ def _keep_mini_injected(api):
         time.sleep(2)
 
 
-def _bundled_dll_candidates(dll_name):
-    """번들/설치 트리에서 dll_name 을 모두 찾아 경로 목록으로 반환."""
+def _dll_search_roots():
     roots = []
     mp = getattr(sys, "_MEIPASS", None)
     if mp:
@@ -2406,18 +2437,54 @@ def _bundled_dll_candidates(dll_name):
         roots.append(os.path.dirname(os.path.abspath(webview.__file__)))
     except Exception:
         pass
-    found, seen = [], set()
-    for root in roots:
-        if not root or root in seen:
-            continue
-        seen.add(root)
+    try:
+        roots.append(os.path.dirname(os.path.abspath(sys.executable)))
+    except Exception:
+        pass
+    out, seen = [], set()
+    for r in roots:
+        if r and r not in seen and os.path.isdir(r):
+            seen.add(r)
+            out.append(r)
+    return out
+
+
+def _bundled_dll_candidates(dll_name):
+    """번들/설치 트리에서 dll_name 을 모두 찾아 경로 목록으로 반환 (대소문자 무시)."""
+    target = (dll_name or "").lower()
+    found = []
+    for root in _dll_search_roots():
         try:
             for dirpath, _dirs, files in os.walk(root):
-                if dll_name in files:
-                    found.append(os.path.join(dirpath, dll_name))
+                for fn in files:
+                    if fn.lower() == target:
+                        found.append(os.path.join(dirpath, fn))
         except Exception:
             pass
     return found
+
+
+def _dump_bundle_webview_dlls():
+    """번들에 실제로 들어 있는 WebView2 관련 DLL 목록을 로그에 남긴다.
+
+    'Cannot find win-arm64' 같은 실패가 났을 때, 무엇이 번들됐는지 확인해
+    빌드 문제인지 경로 문제인지 진단하기 위한 것.
+    """
+    n = 0
+    for root in _dll_search_roots():
+        _log_file("  [bundle root] " + root)
+        try:
+            for dirpath, _dirs, files in os.walk(root):
+                for fn in files:
+                    low = fn.lower()
+                    if low.endswith(".dll") and (
+                            "webview2" in low or "webview2loader" in low):
+                        _log_file("    dll: " + os.path.join(dirpath, fn))
+                        n += 1
+        except Exception:
+            pass
+    if n == 0:
+        _log_file("  (WebView2 DLL 이 번들에 하나도 없음 — 빌드에서 누락됨)")
 
 
 def _patch_pywebview_arch():
@@ -2430,6 +2497,28 @@ def _patch_pywebview_arch():
     동작하므로 번들된 x64 DLL 을 대신 쓰게 한다. edgechromium 모듈이
     임포트되기 전(webview.start 전)에 호출해야 효과가 있다.
     """
+    # 1) 아키텍처 판정 자체를 x64 로 유도한다. ARM Windows 에서 x64 exe 를
+    #    에뮬레이션 실행하면 platform.machine()==ARM64 라 pywebview 가
+    #    win-arm64 DLL(번들에 없음)을 찾는다. 에뮬레이션(프로세스 아키텍처가
+    #    AMD64)일 때만 machine 을 AMD64 로 바꿔 win-x64 DLL 을 쓰게 한다.
+    try:
+        import platform as _pf
+        if not getattr(_pf.machine, "_arm_patched", False):
+            _orig_machine = _pf.machine
+            _pa = (os.environ.get("PROCESSOR_ARCHITECTURE") or "").upper()
+
+            def _machine_patched():
+                m = _orig_machine()
+                if (m or "").upper() == "ARM64" and _pa == "AMD64":
+                    return "AMD64"
+                return m
+
+            _machine_patched._arm_patched = True
+            _pf.machine = _machine_patched
+    except Exception:
+        pass
+
+    # 2) 그래도 못 찾는 경우를 대비해 interop_dll_path 에 번들 탐색 폴백을 건다.
     try:
         from webview import util as _wvutil
     except Exception:
@@ -2471,6 +2560,10 @@ def _patch_pywebview_arch():
         if cands:
             _log_file("interop_dll_path: %s -> 대체 %s" % (dll_name, cands[0]))
             return cands[0]
+        # 번들에서 못 찾음 — 무엇이 들어 있는지 진단 로그를 남기고 원래 예외 전파
+        _log_file("interop_dll_path: '%s' 을(를) 번들에서 찾지 못함. 번들 내용:"
+                  % dll_name)
+        _dump_bundle_webview_dlls()
         return orig(dll_name)   # 최후엔 원래 예외를 그대로 전파
 
     interop_dll_path._arch_patched = True
@@ -2478,6 +2571,59 @@ def _patch_pywebview_arch():
         _wvutil.interop_dll_path = interop_dll_path
     except Exception:
         pass
+
+
+MONITOR_DEFAULTTONULL = 0
+
+
+def _pos_on_screen(x, y, w, h):
+    """창 좌표가 실제 모니터 위에 있는지(완전히 화면 밖이 아닌지).
+
+    검증할 수 없으면(비-Windows 등) True 로 둬서 저장값을 그대로 쓴다.
+    """
+    u = _user32()
+    if u is None:
+        return True
+    pts = ((x + 8, y + 8),
+           (x + max(1, w // 2), y + max(1, h // 2)),
+           (x + max(0, w - 8), y + 8))
+    for px, py in pts:
+        try:
+            if u.MonitorFromPoint(wintypes.POINT(int(px), int(py)),
+                                  MONITOR_DEFAULTTONULL):
+                return True
+        except Exception:
+            return True
+    return False
+
+
+def _valid_geometry(cfg):
+    """저장된 창 크기/위치를 검증해 (width, height, x|None, y|None) 반환.
+
+    - 기본값은 '기본 크기' 메뉴와 동일한 BASE_W x BASE_H.
+    - 사용자가 저장한 크기가 있으면 그대로 사용한다.
+    - 값이 손상됐으면(정수 아님/0 이하/비현실적으로 큼) 기본 크기로 되돌린다.
+      (손잡이로 줄인 작은 값 >=MIN 은 사용자의 선택이므로 존중한다.)
+    - 위치가 완전히 화면 밖이면 폐기(None)해 자동 배치되게 한다.
+    """
+    try:
+        w = int(cfg.get("width", BASE_W))
+        h = int(cfg.get("height", BASE_H))
+    except (TypeError, ValueError):
+        w, h = BASE_W, BASE_H
+    if not (MIN_W <= w <= 20000) or not (MIN_H <= h <= 20000):
+        _log_file("저장된 창 크기가 이상해 기본 크기로 복원 (w=%r h=%r)"
+                  % (cfg.get("width"), cfg.get("height")))
+        w, h = BASE_W, BASE_H
+    x, y = cfg.get("x"), cfg.get("y")
+    try:
+        x, y = int(x), int(y)
+    except (TypeError, ValueError):
+        return w, h, None, None
+    if not _pos_on_screen(x, y, w, h):
+        _log_file("저장된 창 위치가 화면 밖이라 자동 배치 (x=%d y=%d)" % (x, y))
+        return w, h, None, None
+    return w, h, x, y
 
 
 def main():
@@ -2512,6 +2658,10 @@ def main():
     _patch_pywebview_arch()
 
     cfg = load_config()
+    # 이전 실행이 비정상 종료돼 우리 프로필을 잠근 채 남은 WebView2 프로세스를
+    # 먼저 정리 — 이게 남아 있으면 이번 실행의 엔진 초기화도 실패해
+    # '프로필 복구 후 재시작'이 반복된다. (우리 WebView2 가 뜨기 전에 호출)
+    _kill_profile_lockers()
     # 지난 실행에서 엔진 초기화 실패로 프로필 복구가 예약된 경우:
     # 이전 프로세스(웹뷰 포함)가 완전히 내려간 뒤 엔진 데이터만 삭제.
     # 이전 인스턴스의 WebView2 자식이 늦게 내려가 프로필이 잠겨 있으면
@@ -2535,15 +2685,26 @@ def main():
     if cfg.get("lastUrl") and last_t > 5 and "t=" not in start_url:
         start_url += ("&" if "?" in start_url else "?") + "t=%ds" % max(0, last_t - 2)
 
+    # 창 크기/위치 결정: 기본='기본 크기'(BASE), 저장된 사용자 크기가 있으면
+    # 그 크기, 손상/화면밖이면 다시 기본으로. 결정값을 설정에도 반영해 이후
+    # 저장/복원이 일관되게 한다.
+    win_w, win_h, win_x, win_y = _valid_geometry(cfg)
+    cfg["width"], cfg["height"] = win_w, win_h
+    if win_x is None:
+        cfg.pop("x", None)
+        cfg.pop("y", None)
+    else:
+        cfg["x"], cfg["y"] = win_x, win_y
+
     api = Api(cfg)
     window = webview.create_window(
         "YT Mini",
         url=start_url,
         js_api=api,
-        width=int(cfg.get("width", BASE_W)),
-        height=int(cfg.get("height", BASE_H)),
-        x=cfg.get("x"),
-        y=cfg.get("y"),
+        width=win_w,
+        height=win_h,
+        x=win_x,
+        y=win_y,
         on_top=bool(cfg.get("onTop", True)),
         resizable=True,
         min_size=(MIN_W, MIN_H),
