@@ -2657,6 +2657,8 @@ def main():
     # webview.start 가 죽는 문제 방지 — 반드시 창 생성/start 전에 적용
     _patch_pywebview_arch()
 
+    # 설정 파일 존재 여부로 '최초 실행'을 판정 (config 를 쓰기 전에 확인).
+    first_run = not os.path.exists(CONFIG_PATH)
     cfg = load_config()
     # 이전 실행이 비정상 종료돼 우리 프로필을 잠근 채 남은 WebView2 프로세스를
     # 먼저 정리 — 이게 남아 있으면 이번 실행의 엔진 초기화도 실패해
@@ -2685,10 +2687,15 @@ def main():
     if cfg.get("lastUrl") and last_t > 5 and "t=" not in start_url:
         start_url += ("&" if "?" in start_url else "?") + "t=%ds" % max(0, last_t - 2)
 
-    # 창 크기/위치 결정: 기본='기본 크기'(BASE), 저장된 사용자 크기가 있으면
-    # 그 크기, 손상/화면밖이면 다시 기본으로. 결정값을 설정에도 반영해 이후
-    # 저장/복원이 일관되게 한다.
-    win_w, win_h, win_x, win_y = _valid_geometry(cfg)
+    # 창 크기/위치 결정:
+    #  - 최초 실행: 무조건 기본 크기(BASE)로 고정, 위치는 자동 배치.
+    #  - 이후 실행: 저장된 사용자 크기 사용, 손상/화면밖이면 다시 기본으로.
+    # 결정값을 설정에도 반영해 이후 저장/복원이 일관되게 한다.
+    if first_run:
+        win_w, win_h, win_x, win_y = BASE_W, BASE_H, None, None
+        _log_file("최초 실행 — 창 크기를 기본 크기로 고정 (%dx%d)" % (BASE_W, BASE_H))
+    else:
+        win_w, win_h, win_x, win_y = _valid_geometry(cfg)
     cfg["width"], cfg["height"] = win_w, win_h
     if win_x is None:
         cfg.pop("x", None)
