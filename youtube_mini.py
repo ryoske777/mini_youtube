@@ -650,6 +650,7 @@ MINI_HOOK_JS = r"""
   var SKIP_SEL = [
     '[class*="ytp-ad-skip-button"]',
     '[class*="ytp-skip-ad-button"]',
+    '[id^="skip-button"]',
     '.ytp-ad-skip-button-container',
     '.videoAdUiSkipButton'
   ].join(',');
@@ -662,17 +663,41 @@ MINI_HOOK_JS = r"""
     if (up) return up;                             // 텍스트/아이콘의 바깥 버튼
     return el;                                     // 버튼이 따로 없으면 자기 자신
   }
+  function fire(el){
+    if (!el) return;
+    var b = realButton(el);
+    if (!b) return;
+    // click() 만으로 안 먹는 경우가 있어 포인터/마우스 이벤트도 함께 보낸다
+    try { b.click(); } catch(e){}
+    try {
+      ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(function(t){
+        b.dispatchEvent(new MouseEvent(t, {bubbles:true, cancelable:true, view:window}));
+      });
+    } catch(e){}
+  }
   function handleAds(){
     try {
-      // 건너뛰기 버튼(활성 상태)이 뜨면 대신 눌러준다. 여러 개가 잡혀도 모두 시도.
+      // A) 클래스/ID 로 건너뛰기 버튼 잡기 (여러 개면 모두 시도)
       var nodes = document.querySelectorAll(SKIP_SEL);
-      for (var i = 0; i < nodes.length; i++){
-        var btn = realButton(nodes[i]);
-        if (btn){ try { btn.click(); } catch(e){} }
+      for (var i = 0; i < nodes.length; i++){ fire(nodes[i]); }
+      // B) 텍스트/aria 로 잡기 — 클래스명이 바뀌어도 '건너뛰기'/'Skip' 라벨로
+      //    확실히 찾는다. 플레이어/광고 영역 안의 버튼만 대상으로 오작동 방지.
+      var scope = document.querySelector('#movie_player')
+               || document.querySelector('.html5-video-player') || document;
+      var cands = scope.querySelectorAll('button, [role="button"]');
+      for (var j = 0; j < cands.length; j++){
+        var el = cands[j];
+        var lbl = ((el.textContent || '') + ' '
+                   + (el.getAttribute('aria-label') || '')).toLowerCase();
+        var cls = (el.className || '') + '';
+        if (lbl.indexOf('건너뛰기') >= 0 || /\bskip\b/.test(lbl)
+            || /skip/i.test(cls)){
+          fire(el);
+        }
       }
-      // 하단 배너 오버레이 광고의 닫기(X)도 사람이 누르는 것과 동일하게 클릭
+      // C) 하단 배너 오버레이 광고의 닫기(X)
       var close = document.querySelector('.ytp-ad-overlay-close-button');
-      if (close){ try { realButton(close).click(); } catch(e){} }
+      if (close){ fire(close); }
     } catch(e){}
   }
   setInterval(handleAds, 400);
