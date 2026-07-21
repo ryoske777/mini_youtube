@@ -702,6 +702,38 @@ MINI_HOOK_JS = r"""
   }
   setInterval(handleAds, 400);
 
+  // ---- 광고 진단 로그 ----
+  // 광고가 뜨는데도 안 넘어가면, 그 순간 화면의 버튼들이 어떻게 생겼는지
+  // (클래스/aria/텍스트) 로그에 한 번 남긴다. 이걸로 정확한 스킵 버튼
+  // 선택자를 알아낼 수 있다. (광고 하나당 1회, 3초 뒤에도 광고면 기록)
+  var adDiagShown = false, adFirstSeen = 0;
+  function adDiag(){
+    try {
+      var player = document.querySelector('#movie_player')
+                || document.querySelector('.html5-video-player');
+      var adShowing = !!(player && player.classList
+                         && player.classList.contains('ad-showing'));
+      if (!adShowing){ adDiagShown = false; adFirstSeen = 0; return; }
+      if (!adFirstSeen) adFirstSeen = Date.now();
+      if (adDiagShown || Date.now() - adFirstSeen < 3000) return;
+      adDiagShown = true;
+      var scope = player || document;
+      var btns = scope.querySelectorAll('button, [role="button"], a');
+      var info = [];
+      for (var i = 0; i < btns.length && info.length < 30; i++){
+        var b = btns[i];
+        var cls = (b.getAttribute && b.getAttribute('class')) || '';
+        var al = (b.getAttribute && b.getAttribute('aria-label')) || '';
+        var tx = ((b.textContent || '').trim()).slice(0, 24);
+        if (cls || al || tx)
+          info.push('[cls=' + cls + ' | al=' + al + ' | tx=' + tx + ']');
+      }
+      var a = api();
+      if (a) a.log('AD-DIAG buttons(' + btns.length + '): ' + info.join('  '));
+    } catch(e){}
+  }
+  setInterval(adDiag, 1000);
+
   // 주기 작업: 자동재생(알고리즘 다음 영상) 켜기, 마지막 영상 저장,
   // 재생 불가 감지, 플레이어 리사이즈.
   setInterval(function(){
@@ -786,7 +818,8 @@ MENU_HTML = r"""<!DOCTYPE html>
       ['ontop',    function(){ return (st.onTop ? '✓ ' : '') + '항상 위'; }],
       ['scale1',   function(){ return '기본 크기'; }],
       ['minimize', function(){ return '최소화'; }],
-      ['tray',     function(){ return '트레이'; }]
+      ['tray',     function(){ return '트레이'; }],
+      ['logs',     function(){ return '로그 보기'; }]
     ],
     [   // 뮤직
       ['music',    function(){ return '유튜브 뮤직'; }],
