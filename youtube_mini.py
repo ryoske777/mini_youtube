@@ -639,10 +639,11 @@ MINI_HOOK_JS = r"""
   grip.addEventListener('pointerup', function(){ resizing = false; });
   grip.addEventListener('pointercancel', function(){ resizing = false; });
 
-  // ---- 광고 자동 건너뛰기 ----
+  // ---- 광고 '건너뛰기 버튼' 자동 클릭 (안전 모드) ----
   // 실드가 클릭을 막아 화면의 '건너뛰기' 버튼을 직접 누를 수 없으므로,
-  // 버튼이 뜨면 JS 로 자동 클릭한다. 건너뛰기가 불가능한 광고는 광고
-  // 영상을 끝으로 보내 즉시 끝낸다(본 영상은 절대 건드리지 않음).
+  // 버튼이 뜨면 JS 로 대신 눌러준다. 이것은 사람이 버튼을 누르는 것과
+  // 동일한 동작이며, 광고를 강제로 끝내거나(fast-forward) 네트워크 단에서
+  // 차단하지 않는다 — 계정/약관 관점에서 가장 안전한 방식.
   var SKIP_SEL = [
     '.ytp-skip-ad-button',
     '.ytp-ad-skip-button',
@@ -652,26 +653,15 @@ MINI_HOOK_JS = r"""
   ].join(',');
   function handleAds(){
     try {
-      var player = document.querySelector('#movie_player')
-                || document.querySelector('.html5-video-player');
-      var adShowing = !!(player && player.classList
-                         && player.classList.contains('ad-showing'));
-      // 1) 건너뛰기 버튼이 있으면 클릭 (버튼 자체 또는 안쪽 텍스트/부모)
+      // 건너뛰기 버튼이 활성화돼 있으면 클릭 (버튼 자체 또는 안쪽 텍스트/부모)
       var skip = document.querySelector(SKIP_SEL);
       if (skip){
         var btn = skip.closest ? (skip.closest('button') || skip) : skip;
         try { btn.click(); } catch(e){}
       }
-      if (adShowing){
-        var v = document.querySelector('video');
-        // 2) 건너뛰기 불가 광고: 광고 영상을 끝으로 보내 즉시 종료
-        if (v && isFinite(v.duration) && v.duration > 0){
-          try { v.currentTime = v.duration; } catch(e){}
-        }
-        // 3) 하단 오버레이(배너) 광고 닫기
-        var close = document.querySelector('.ytp-ad-overlay-close-button');
-        if (close){ try { close.click(); } catch(e){} }
-      }
+      // 하단 배너 오버레이 광고의 닫기(X)도 사람이 누르는 것과 동일하게 클릭
+      var close = document.querySelector('.ytp-ad-overlay-close-button');
+      if (close){ try { close.click(); } catch(e){} }
     } catch(e){}
   }
   setInterval(handleAds, 400);
