@@ -54,6 +54,42 @@ import threading
 import time
 from ctypes import wintypes
 
+
+def _force_x64_arch_on_arm():
+    """Windows on ARM 대응 — 반드시 'import webview' 보다 먼저 실행.
+
+    pywebview 는 webview.util 을 임포트하는 순간 아키텍처로 인터롭 DLL 경로
+    (win-x64 / win-arm64 …)를 정한다. x64 로 빌드한 exe 를 ARM Windows 에서
+    에뮬레이션 실행하면 platform.machine()/uname().machine 이 ARM64 라
+    win-arm64(번들에 없음)를 찾다가 'Cannot find win-arm64' 로 죽는다.
+    실제로는 x64 에뮬레이션이므로 프로세스 아키텍처(PROCESSOR_ARCHITECTURE)가
+    AMD64 일 때만, 아키텍처를 AMD64 로 보이게 해서 번들된 win-x64 DLL 을 쓴다.
+    """
+    try:
+        if os.environ.get("PROCESSOR_ARCHITECTURE", "").upper() != "AMD64":
+            return   # 네이티브 arm64/x86 등은 건드리지 않음
+        # platform 이 ARM64 로 읽는 원천 두 가지를 모두 무력화한다:
+        #  1) 환경변수(PROCESSOR_ARCHITEW6432) — uname().machine 이 이걸 본다
+        #  2) platform.machine / platform.uname 캐시
+        os.environ.pop("PROCESSOR_ARCHITEW6432", None)
+        import platform as _pf
+        try:
+            _pf._uname_cache = None
+        except Exception:
+            pass
+        _orig_machine = _pf.machine
+
+        def _machine_amd64():
+            m = _orig_machine()
+            return "AMD64" if (m or "").upper() == "ARM64" else m
+
+        _pf.machine = _machine_amd64
+    except Exception:
+        pass
+
+
+_force_x64_arch_on_arm()
+
 import webview
 
 BASE_W, BASE_H = 226, 126   # 최초 실행 기본 크기 (이후엔 저장된 크기 사용)
@@ -820,6 +856,10 @@ class Api:
         self._cham_visible = True
         self._cham_last_set = None      # 감시 스레드가 마지막으로 지정한 위치
         self._cham_thread = None
+        # 로드중 스플래시 (네이티브 WinForms — WebView2 안 씀)
+        self._splash = None
+        self._splash_label = None
+        self._splash_done = False
 
     def _persist_later(self, delay=0.5):
         if self._save_timer is not None:
@@ -1037,9 +1077,12 @@ class Api:
         # (2) 다음 실행의 프로필 잠금(엔진 초기화 실패)을 막을 수 있다.
         def _final_exit():
             _kill_descendants()
+            # 자식이 _MEI 임시폴더 핸들을 놓을 시간을 준 뒤 종료 —
+            # 곧바로 나가면 PyInstaller 부트로더가 삭제에 실패해 경고가 뜬다
+            time.sleep(1.0)
             os._exit(0)
 
-        t = threading.Timer(1.5, _final_exit)
+        t = threading.Timer(1.2, _final_exit)
         t.daemon = True
         t.start()
 
@@ -1843,6 +1886,124 @@ class Api:
         except Exception:
             pass
 
+    # ---- 로드중 스플래시 (네이티브 WinForms 오버레이) ----
+    # 미니 창이 유튜브를 로딩하는 동안(마스트헤드 깜빡임/작은 창 노출) 위에
+    # '로드중' 오버레이를 덮어 가린다. 추가 WebView2 를 만들지 않아(느린 ARM
+    # 에뮬레이션에서도) 엔진 초기화에 부담을 주지 않는다.
+
+    def _make_or_move_splash(self, x, y, w, h):
+        def fn():
+            if self._splash_done:      # 이미 걷어내기로 결정됨
+                return
+            try:
+                from System.Windows.Forms import (Form, Label, FormBorderStyle,
+                                                   DockStyle)
+                from System.Drawing import Color, Font, ContentAlignment
+                first = self._splash is None
+                if first:
+                    f = Form()
+                    f.FormBorderStyle = getattr(FormBorderStyle, "None")
+                    f.ShowInTaskbar = False
+                    f.TopMost = True
+                    f.BackColor = Color.FromArgb(15, 15, 15)
+                    lbl = Label()
+                    lbl.Dock = DockStyle.Fill
+                    lbl.TextAlign = ContentAlignment.MiddleCenter
+                    lbl.ForeColor = Color.FromArgb(235, 235, 235)
+                    try:
+                        lbl.Font = Font("Malgun Gothic", 9.0)
+                    except Exception:
+                        pass
+                    lbl.Text = "YouTube Mini\n로드중입니다..."
+                    f.Controls.Add(lbl)
+                    self._splash_label = lbl
+                    self._splash = f
+                f = self._splash
+                try:
+                    f.SetBounds(int(x), int(y), int(w), int(h))
+                except Exception:
+                    pass
+                # 최초 1회는 Show() 로 확실히 그린다(라벨 렌더 보장). 이후엔
+                # 포커스 뺏지 않고 위치/최상위만 갱신(SetWindowPos NOACTIVATE).
+                if first:
+                    try:
+                        f.Show()
+                    except Exception:
+                        pass
+                u = _user32()
+                hs = None
+                try:
+                    hs = int(f.Handle.ToInt64())
+                except Exception:
+                    hs = None
+                if u is not None and hs:
+                    u.SetWindowPos(hs, HWND_TOPMOST, int(x), int(y), int(w), int(h),
+                                   SWP_SHOWWINDOW | SWP_NOACTIVATE)
+            except Exception as e:
+                _log_file("splash make/move failed: %r" % (e,))
+        self._on_ui_thread(fn)
+
+    def _hide_splash(self):
+        if self._splash_done:
+            return
+        self._splash_done = True
+
+        def fn():
+            try:
+                if self._splash is not None:
+                    self._splash.Hide()
+                    self._splash.Dispose()
+            except Exception:
+                pass
+            self._splash = None
+            self._splash_label = None
+        self._on_ui_thread(fn)
+
+    def _splash_watch(self):
+        """미니 창이 준비될 때까지 '로드중' 오버레이를 덮어둔다.
+
+        준비 = WebView2 loaded + 주입 훅 적용(마스트헤드 숨김) + 영상 프레임
+        확보(video.readyState>=2). 너무 오래 안 되면(45초) 안전하게 걷어내
+        사용자가 조작할 수 있게 한다.
+        """
+        u = _user32()
+        deadline = time.time() + 45
+        last_query = 0.0
+        last_rect = None
+        while time.time() < deadline and not self._splash_done:
+            try:
+                if self._window not in webview.windows:
+                    break
+            except Exception:
+                pass
+            # 미니 창 위치/크기가 바뀔 때만 오버레이를 다시 맞춰 덮는다
+            try:
+                mh = self._hwnd_of(self._window)
+                if mh and u is not None:
+                    r = wintypes.RECT()
+                    u.GetWindowRect(mh, ctypes.byref(r))
+                    w, h = r.right - r.left, r.bottom - r.top
+                    rect = (r.left, r.top, w, h)
+                    if w > 0 and h > 0 and rect != last_rect:
+                        last_rect = rect
+                        self._make_or_move_splash(r.left, r.top, w, h)
+            except Exception:
+                pass
+            # 준비 판정 (loaded 이후에만 질의, 과도한 호출 방지 위해 0.3s 간격)
+            if self._engine_ok and (time.time() - last_query) >= 0.3:
+                last_query = time.time()
+                try:
+                    rr = self._window.evaluate_js(
+                        "(function(){try{var v=document.querySelector('video');"
+                        "return (window.__miniHooked===true&&v&&v.readyState>=2)"
+                        "?'1':'0';}catch(e){return '0';}})()")
+                    if rr == "1":
+                        break
+                except Exception:
+                    pass
+            time.sleep(0.12)
+        self._hide_splash()
+
     def _on_engine_loaded(self, window=None):
         """미니 창 loaded 이벤트: WebView2 정상 표시 + UI 주입."""
         self._engine_ok = True
@@ -2343,6 +2504,9 @@ def _keep_mini_injected(api):
     t.start()
     t2 = threading.Thread(target=_engine_watchdog, args=(api,), daemon=True)
     t2.start()
+    # 유튜브가 다 로드될 때까지 '로드중' 오버레이로 미니 창을 덮는다
+    t3 = threading.Thread(target=api._splash_watch, daemon=True)
+    t3.start()
     # 시작 시 저장된 불투명도 적용
     try:
         api._apply_opacity(int(api._config.get("opacity", 100)))
@@ -2497,28 +2661,9 @@ def _patch_pywebview_arch():
     동작하므로 번들된 x64 DLL 을 대신 쓰게 한다. edgechromium 모듈이
     임포트되기 전(webview.start 전)에 호출해야 효과가 있다.
     """
-    # 1) 아키텍처 판정 자체를 x64 로 유도한다. ARM Windows 에서 x64 exe 를
-    #    에뮬레이션 실행하면 platform.machine()==ARM64 라 pywebview 가
-    #    win-arm64 DLL(번들에 없음)을 찾는다. 에뮬레이션(프로세스 아키텍처가
-    #    AMD64)일 때만 machine 을 AMD64 로 바꿔 win-x64 DLL 을 쓰게 한다.
-    try:
-        import platform as _pf
-        if not getattr(_pf.machine, "_arm_patched", False):
-            _orig_machine = _pf.machine
-            _pa = (os.environ.get("PROCESSOR_ARCHITECTURE") or "").upper()
-
-            def _machine_patched():
-                m = _orig_machine()
-                if (m or "").upper() == "ARM64" and _pa == "AMD64":
-                    return "AMD64"
-                return m
-
-            _machine_patched._arm_patched = True
-            _pf.machine = _machine_patched
-    except Exception:
-        pass
-
-    # 2) 그래도 못 찾는 경우를 대비해 interop_dll_path 에 번들 탐색 폴백을 건다.
+    # 아키텍처 판정은 이미 import 전에 _force_x64_arch_on_arm() 으로 x64 로
+    # 맞춰 두었다. 여기서는 그래도 DLL 을 못 찾는 경우를 대비해
+    # interop_dll_path 에 번들 탐색 폴백을 건다.
     try:
         from webview import util as _wvutil
     except Exception:
@@ -2750,6 +2895,7 @@ def main():
     except Exception:
         pass
     _kill_descendants()
+    time.sleep(1.0)   # 자식이 _MEI 핸들을 놓을 시간 (임시폴더 삭제 실패 경고 방지)
     os._exit(0)
 
 
