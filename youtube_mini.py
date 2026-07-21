@@ -639,6 +639,43 @@ MINI_HOOK_JS = r"""
   grip.addEventListener('pointerup', function(){ resizing = false; });
   grip.addEventListener('pointercancel', function(){ resizing = false; });
 
+  // ---- 광고 자동 건너뛰기 ----
+  // 실드가 클릭을 막아 화면의 '건너뛰기' 버튼을 직접 누를 수 없으므로,
+  // 버튼이 뜨면 JS 로 자동 클릭한다. 건너뛰기가 불가능한 광고는 광고
+  // 영상을 끝으로 보내 즉시 끝낸다(본 영상은 절대 건드리지 않음).
+  var SKIP_SEL = [
+    '.ytp-skip-ad-button',
+    '.ytp-ad-skip-button',
+    '.ytp-ad-skip-button-modern',
+    '.ytp-ad-skip-button-container button',
+    '.ytp-skip-ad-button__text'
+  ].join(',');
+  function handleAds(){
+    try {
+      var player = document.querySelector('#movie_player')
+                || document.querySelector('.html5-video-player');
+      var adShowing = !!(player && player.classList
+                         && player.classList.contains('ad-showing'));
+      // 1) 건너뛰기 버튼이 있으면 클릭 (버튼 자체 또는 안쪽 텍스트/부모)
+      var skip = document.querySelector(SKIP_SEL);
+      if (skip){
+        var btn = skip.closest ? (skip.closest('button') || skip) : skip;
+        try { btn.click(); } catch(e){}
+      }
+      if (adShowing){
+        var v = document.querySelector('video');
+        // 2) 건너뛰기 불가 광고: 광고 영상을 끝으로 보내 즉시 종료
+        if (v && isFinite(v.duration) && v.duration > 0){
+          try { v.currentTime = v.duration; } catch(e){}
+        }
+        // 3) 하단 오버레이(배너) 광고 닫기
+        var close = document.querySelector('.ytp-ad-overlay-close-button');
+        if (close){ try { close.click(); } catch(e){} }
+      }
+    } catch(e){}
+  }
+  setInterval(handleAds, 400);
+
   // 주기 작업: 자동재생(알고리즘 다음 영상) 켜기, 마지막 영상 저장,
   // 재생 불가 감지, 플레이어 리사이즈.
   setInterval(function(){
