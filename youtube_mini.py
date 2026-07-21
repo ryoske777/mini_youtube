@@ -54,6 +54,42 @@ import threading
 import time
 from ctypes import wintypes
 
+
+def _force_x64_arch_on_arm():
+    """Windows on ARM 대응 — 반드시 'import webview' 보다 먼저 실행.
+
+    pywebview 는 webview.util 을 임포트하는 순간 아키텍처로 인터롭 DLL 경로
+    (win-x64 / win-arm64 …)를 정한다. x64 로 빌드한 exe 를 ARM Windows 에서
+    에뮬레이션 실행하면 platform.machine()/uname().machine 이 ARM64 라
+    win-arm64(번들에 없음)를 찾다가 'Cannot find win-arm64' 로 죽는다.
+    실제로는 x64 에뮬레이션이므로 프로세스 아키텍처(PROCESSOR_ARCHITECTURE)가
+    AMD64 일 때만, 아키텍처를 AMD64 로 보이게 해서 번들된 win-x64 DLL 을 쓴다.
+    """
+    try:
+        if os.environ.get("PROCESSOR_ARCHITECTURE", "").upper() != "AMD64":
+            return   # 네이티브 arm64/x86 등은 건드리지 않음
+        # platform 이 ARM64 로 읽는 원천 두 가지를 모두 무력화한다:
+        #  1) 환경변수(PROCESSOR_ARCHITEW6432) — uname().machine 이 이걸 본다
+        #  2) platform.machine / platform.uname 캐시
+        os.environ.pop("PROCESSOR_ARCHITEW6432", None)
+        import platform as _pf
+        try:
+            _pf._uname_cache = None
+        except Exception:
+            pass
+        _orig_machine = _pf.machine
+
+        def _machine_amd64():
+            m = _orig_machine()
+            return "AMD64" if (m or "").upper() == "ARM64" else m
+
+        _pf.machine = _machine_amd64
+    except Exception:
+        pass
+
+
+_force_x64_arch_on_arm()
+
 import webview
 
 BASE_W, BASE_H = 226, 126   # 최초 실행 기본 크기 (이후엔 저장된 크기 사용)
@@ -2497,28 +2533,9 @@ def _patch_pywebview_arch():
     동작하므로 번들된 x64 DLL 을 대신 쓰게 한다. edgechromium 모듈이
     임포트되기 전(webview.start 전)에 호출해야 효과가 있다.
     """
-    # 1) 아키텍처 판정 자체를 x64 로 유도한다. ARM Windows 에서 x64 exe 를
-    #    에뮬레이션 실행하면 platform.machine()==ARM64 라 pywebview 가
-    #    win-arm64 DLL(번들에 없음)을 찾는다. 에뮬레이션(프로세스 아키텍처가
-    #    AMD64)일 때만 machine 을 AMD64 로 바꿔 win-x64 DLL 을 쓰게 한다.
-    try:
-        import platform as _pf
-        if not getattr(_pf.machine, "_arm_patched", False):
-            _orig_machine = _pf.machine
-            _pa = (os.environ.get("PROCESSOR_ARCHITECTURE") or "").upper()
-
-            def _machine_patched():
-                m = _orig_machine()
-                if (m or "").upper() == "ARM64" and _pa == "AMD64":
-                    return "AMD64"
-                return m
-
-            _machine_patched._arm_patched = True
-            _pf.machine = _machine_patched
-    except Exception:
-        pass
-
-    # 2) 그래도 못 찾는 경우를 대비해 interop_dll_path 에 번들 탐색 폴백을 건다.
+    # 아키텍처 판정은 이미 import 전에 _force_x64_arch_on_arm() 으로 x64 로
+    # 맞춰 두었다. 여기서는 그래도 DLL 을 못 찾는 경우를 대비해
+    # interop_dll_path 에 번들 탐색 폴백을 건다.
     try:
         from webview import util as _wvutil
     except Exception:
