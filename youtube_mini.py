@@ -644,24 +644,35 @@ MINI_HOOK_JS = r"""
   // 버튼이 뜨면 JS 로 대신 눌러준다. 이것은 사람이 버튼을 누르는 것과
   // 동일한 동작이며, 광고를 강제로 끝내거나(fast-forward) 네트워크 단에서
   // 차단하지 않는다 — 계정/약관 관점에서 가장 안전한 방식.
+  // 유튜브 버전마다 클래스명이 달라, ytp-ad-skip / ytp-skip-ad 를 포함하는
+  // 요소를 폭넓게(부분일치) 잡는다. 컨테이너(div)가 잡혀도 실제 버튼을
+  // 안(자손)이나 밖(조상)에서 찾아 누른다.
   var SKIP_SEL = [
-    '.ytp-skip-ad-button',
-    '.ytp-ad-skip-button',
-    '.ytp-ad-skip-button-modern',
-    '.ytp-ad-skip-button-container button',
-    '.ytp-skip-ad-button__text'
+    '[class*="ytp-ad-skip-button"]',
+    '[class*="ytp-skip-ad-button"]',
+    '.ytp-ad-skip-button-container',
+    '.videoAdUiSkipButton'
   ].join(',');
+  function realButton(el){
+    if (!el) return null;
+    if (el.tagName === 'BUTTON') return el;
+    var inner = el.querySelector && el.querySelector('button');
+    if (inner) return inner;                       // 컨테이너 안쪽 버튼
+    var up = el.closest && el.closest('button');
+    if (up) return up;                             // 텍스트/아이콘의 바깥 버튼
+    return el;                                     // 버튼이 따로 없으면 자기 자신
+  }
   function handleAds(){
     try {
-      // 건너뛰기 버튼이 활성화돼 있으면 클릭 (버튼 자체 또는 안쪽 텍스트/부모)
-      var skip = document.querySelector(SKIP_SEL);
-      if (skip){
-        var btn = skip.closest ? (skip.closest('button') || skip) : skip;
-        try { btn.click(); } catch(e){}
+      // 건너뛰기 버튼(활성 상태)이 뜨면 대신 눌러준다. 여러 개가 잡혀도 모두 시도.
+      var nodes = document.querySelectorAll(SKIP_SEL);
+      for (var i = 0; i < nodes.length; i++){
+        var btn = realButton(nodes[i]);
+        if (btn){ try { btn.click(); } catch(e){} }
       }
       // 하단 배너 오버레이 광고의 닫기(X)도 사람이 누르는 것과 동일하게 클릭
       var close = document.querySelector('.ytp-ad-overlay-close-button');
-      if (close){ try { close.click(); } catch(e){} }
+      if (close){ try { realButton(close).click(); } catch(e){} }
     } catch(e){}
   }
   setInterval(handleAds, 400);
