@@ -56,7 +56,7 @@ from ctypes import wintypes
 
 # 배포 버전. 새 코드를 main 브랜치에 올릴 때마다 반드시 올려야(증가) 자동
 # 업데이트가 인식한다. 형식은 자유지만 숫자가 커지는 방향으로.
-VERSION = "2026.07.21.2"
+VERSION = "2026.07.21.3"
 
 # 자동 업데이트 소스 — main 브랜치의 youtube_mini.py (raw, 공개 접근).
 # 사용자에게 배포하려면 변경사항을 main 에 병합/푸시하고 VERSION 을 올린다.
@@ -902,7 +902,8 @@ MENU_HTML = r"""<!DOCTYPE html>
       ['scale1',   function(){ return '기본 크기'; }],
       ['minimize', function(){ return '최소화'; }],
       ['tray',     function(){ return '트레이'; }],
-      ['logs',     function(){ return '로그 보기'; }]
+      ['logs',     function(){ return '로그 보기'; }],
+      ['version',  function(){ return '버전'; }]
     ],
     [   // 뮤직
       ['music',    function(){ return '유튜브 뮤직'; }],
@@ -1743,6 +1744,8 @@ class Api:
                 self.toggle_chameleon()
             elif name == "logs":
                 self.show_logs()
+            elif name == "version":
+                self.check_update()
             elif name == "tray":
                 self.toggle_tray()
             elif name == "still":
@@ -1942,6 +1945,79 @@ class Api:
                 "YT Mini 로그", html=page, width=720, height=480, on_top=False)
         except Exception as e:
             _log_file("show_logs failed: %r" % (e,))
+
+    # ---- 버전 확인 / 수동 업데이트 ----
+
+    def check_update(self):
+        """'버전' 메뉴: 최신 버전을 확인하고, 새 버전이 있으면 업데이트 여부를
+        물어본 뒤 내려받아 재시작한다. 네트워크/메시지박스가 블로킹되므로
+        반드시 별도 스레드에서 실행한다."""
+        threading.Thread(target=self._check_update_worker, daemon=True).start()
+
+    def _check_update_worker(self):
+        u = _user32()
+
+        def box(text, icon=0x40):
+            # icon: 0x40 정보, 0x30 경고, 0x20 물음
+            try:
+                if u is not None:
+                    return u.MessageBoxW(None, text, "YT Mini 버전",
+                                         icon | 0x00040000)  # MB_TOPMOST
+            except Exception:
+                pass
+            return 0
+
+        # 원격 최신 버전 확인
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                UPDATE_RAW_URL, headers={"User-Agent": "YTMini-updater"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                remote = resp.read().decode("utf-8", "replace")
+            rv = _upd_version_of(remote)
+        except Exception as e:
+            _log_file("version check failed: %r" % (e,))
+            box("업데이트 확인에 실패했어요.\n인터넷 연결을 확인해 주세요.\n\n"
+                "현재 버전: %s" % VERSION, 0x30)
+            return
+        if not rv:
+            box("최신 버전 정보를 읽지 못했어요.\n\n현재 버전: %s" % VERSION, 0x30)
+            return
+        if _upd_key(rv) <= _upd_key(VERSION):
+            box("이미 최신 버전을 사용 중이에요.\n\n현재 버전: %s" % VERSION, 0x40)
+            return
+        # 새 버전 있음 → 업데이트할지 물어봄 (예/아니오)
+        res = box("새 버전이 있어요.\n\n현재 버전: %s\n최신 버전: %s\n\n"
+                  "지금 업데이트할까요?\n(업데이트 후 프로그램이 다시 시작됩니다)"
+                  % (VERSION, rv), 0x24)   # MB_YESNO | MB_ICONQUESTION
+        if res != 6:      # IDYES 아님
+            return
+        if not getattr(sys, "frozen", False):
+            box("개발 모드(.py 직접 실행)에서는 자동 업데이트가 적용되지 않아요.\n"
+                "git 으로 최신 코드를 받아 주세요.", 0x40)
+            return
+        if not _upd_compiles(remote):
+            box("받은 최신 버전이 손상돼 적용할 수 없어요.\n"
+                "잠시 후 다시 시도해 주세요.", 0x30)
+            return
+        # 캐시에 저장 → 재시작 (재시작 시 업데이터가 최신본을 실행)
+        try:
+            cache_dir = os.path.join(PROFILE_DIR, "update")
+            os.makedirs(cache_dir, exist_ok=True)
+            cache_py = os.path.join(cache_dir, "youtube_mini.py")
+            tmp = cache_py + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(remote)
+            os.replace(tmp, cache_py)
+            _log_file("manual update downloaded %s → relaunch" % rv)
+        except Exception as e:
+            _log_file("manual update save failed: %r" % (e,))
+            box("업데이트 저장에 실패했어요:\n%r" % (e,), 0x30)
+            return
+        # 재시작 시 업데이터가 캐시(최신본)를 실행하도록 억제 플래그 해제
+        os.environ.pop("YTMINI_RUNNING_UPDATE", None)
+        os.environ.pop("YTMINI_NOUPDATE", None)
+        _relaunch()
 
     # ---- 홈/구독 브라우저 창 ----
 
