@@ -12,9 +12,11 @@
      아예 콘솔 없이 띄우려면: pythonw youtube_mini.py,
      또는 파일을 youtube_mini.pyw 로 복사해 더블클릭)
 
-단일 exe 만들기 (파이썬 없는 PC 에서도 실행):
-    build_exe.bat 더블클릭 → dist\\YTMini.exe 생성.
-    exe 하나만 복사하면 되고, 콘솔 창 없이 프로그램만 뜬다.
+배포용 빌드 (파이썬 없는 PC 에서도 실행):
+    build_exe.bat 더블클릭 → dist\\YTMini\\ 폴더 생성 (+ dist\\YTMini.zip).
+    폴더째 복사(또는 zip 배포)해 YTMini.exe 실행. 콘솔 창 없이 뜬다.
+    (onedir 방식 — 임시폴더 삭제 실패 경고가 없고 시작이 빠르다. 코드
+     업데이트는 앱 내장 자동 업데이트가 처리하므로 배포는 한 번만.)
     대상 PC 에는 WebView2 런타임만 필요 (Win10/11 대부분 기본 탑재).
 
 조작법:
@@ -56,7 +58,7 @@ from ctypes import wintypes
 
 # 배포 버전. 새 코드를 main 브랜치에 올릴 때마다 반드시 올려야(증가) 자동
 # 업데이트가 인식한다. 형식은 자유지만 숫자가 커지는 방향으로.
-VERSION = "2026.07.21.3"
+VERSION = "2026.07.21.4"
 
 # 자동 업데이트 소스 — main 브랜치의 youtube_mini.py (raw, 공개 접근).
 # 사용자에게 배포하려면 변경사항을 main 에 병합/푸시하고 VERSION 을 올린다.
@@ -98,49 +100,40 @@ def _upd_compiles(src):
         return False
 
 
-def _maybe_run_update():
-    """실행 시 최신 youtube_mini.py 를 받아, 번들보다 최신이면 그걸 실행한다.
-
-    - 단일 exe(frozen)에서만 동작 (개발용 .py 직접 실행 시엔 건너뜀).
-    - 실패(오프라인/오류)하면 그대로 번들 버전으로 진행 (fail-open).
-    - 받은 코드가 컴파일 안 되거나 버전이 더 낮으면 무시 (다운그레이드 방지).
-    - 받은 코드가 실행 중 크래시하면 캐시를 지우고 번들 버전으로 재실행.
-    - 끄는 법: 환경변수 YTMINI_NOUPDATE=1, 또는 config.json 에
-      "autoUpdate": false.
-    반드시 'import webview' 보다 먼저 호출해야, 업데이트 코드가 자체 아키텍처
-    패치 후 webview 를 임포트할 수 있다.
-    """
+def _update_disabled():
     if not getattr(sys, "frozen", False):
-        return
-    if os.environ.get("YTMINI_NOUPDATE") or os.environ.get("YTMINI_RUNNING_UPDATE"):
-        return
-    prof = os.path.join(os.path.expanduser("~"), ".yt_mini_profile")
+        return True
+    if os.environ.get("YTMINI_NOUPDATE"):
+        return True
     try:
+        prof = os.path.join(os.path.expanduser("~"), ".yt_mini_profile")
         with open(os.path.join(prof, "config.json"), encoding="utf-8") as f:
             if json.load(f).get("autoUpdate") is False:
-                return
+                return True
     except Exception:
         pass
-    cache_dir = os.path.join(prof, "update")
-    cache_py = os.path.join(cache_dir, "youtube_mini.py")
-    # 1) 원격 최신 소스 확인 → 번들보다 최신이고 컴파일되면 캐시에 저장
-    try:
-        import urllib.request
-        req = urllib.request.Request(
-            UPDATE_RAW_URL, headers={"User-Agent": "YTMini-updater"})
-        with urllib.request.urlopen(req, timeout=6) as resp:
-            remote = resp.read().decode("utf-8", "replace")
-        rv = _upd_version_of(remote)
-        if rv and _upd_key(rv) > _upd_key(VERSION) and _upd_compiles(remote):
-            os.makedirs(cache_dir, exist_ok=True)
-            tmp = cache_py + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.write(remote)
-            os.replace(tmp, cache_py)
-            _upd_log("downloaded update %s (bundled %s)" % (rv, VERSION))
-    except Exception as e:
-        _upd_log("update check failed: %r" % (e,))
-    # 2) 캐시가 번들보다 최신이면 그 코드를 실행
+    return False
+
+
+def _update_cache_py():
+    return os.path.join(os.path.expanduser("~"), ".yt_mini_profile",
+                        "update", "youtube_mini.py")
+
+
+def _run_cached_update_if_any():
+    """캐시에 받아둔 최신 버전이 번들보다 최신이면 '그것'을 실행한다.
+
+    네트워크를 쓰지 않아 시작이 지연되지 않는다(최신본 다운로드는
+    _background_update_fetch 가 백그라운드에서 하고 '다음 실행'에 적용된다).
+    반드시 'import webview' 보다 먼저 호출 — 업데이트 코드가 자체 아키텍처
+    패치 후 webview 를 임포트할 수 있게. frozen 아니면/끄면/캐시 없으면 통과.
+    - 컴파일 안 되거나 버전이 더 낮으면 무시(다운그레이드 방지).
+    - 실행 중 크래시하면 캐시 폐기 후 번들 버전으로 재시작.
+    끄는 법: 환경변수 YTMINI_NOUPDATE=1 또는 config.json "autoUpdate": false.
+    """
+    if _update_disabled() or os.environ.get("YTMINI_RUNNING_UPDATE"):
+        return
+    cache_py = _update_cache_py()
     try:
         if not os.path.exists(cache_py):
             return
@@ -149,7 +142,7 @@ def _maybe_run_update():
         cv = _upd_version_of(csrc)
         if not (cv and _upd_key(cv) > _upd_key(VERSION) and _upd_compiles(csrc)):
             return
-        _upd_log("launching updated version %s (bundled %s)" % (cv, VERSION))
+        _upd_log("running cached update %s (bundled %s)" % (cv, VERSION))
         os.environ["YTMINI_RUNNING_UPDATE"] = "1"
         g = {"__name__": "__main__", "__file__": cache_py}
         try:
@@ -158,8 +151,7 @@ def _maybe_run_update():
         except SystemExit:
             raise
         except BaseException as e:
-            # 업데이트 코드가 죽었다 → 캐시 폐기 후 번들 버전으로 깨끗이 재실행
-            _upd_log("updated version crashed, reverting to bundled: %r" % (e,))
+            _upd_log("cached update crashed, reverting to bundled: %r" % (e,))
             try:
                 os.remove(cache_py)
             except Exception:
@@ -179,7 +171,35 @@ def _maybe_run_update():
         _upd_log("run cached update failed: %r" % (e,))
 
 
-_maybe_run_update()
+def _background_update_fetch():
+    """원격 최신 소스를 받아 캐시에 저장 — '다음 실행'에 적용된다.
+
+    백그라운드 데몬 스레드에서 돌아 시작 시간에 영향을 주지 않는다.
+    즉시 최신으로 바꾸고 싶으면 우클릭 메뉴의 '버전'을 쓰면 된다.
+    """
+    if _update_disabled() or os.environ.get("YTMINI_RUNNING_UPDATE"):
+        return
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            UPDATE_RAW_URL, headers={"User-Agent": "YTMini-updater"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            remote = resp.read().decode("utf-8", "replace")
+        rv = _upd_version_of(remote)
+        if rv and _upd_key(rv) > _upd_key(VERSION) and _upd_compiles(remote):
+            cache_py = _update_cache_py()
+            os.makedirs(os.path.dirname(cache_py), exist_ok=True)
+            tmp = cache_py + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(remote)
+            os.replace(tmp, cache_py)
+            _upd_log("background: cached update %s for next launch (bundled %s)"
+                     % (rv, VERSION))
+    except Exception as e:
+        _upd_log("background update fetch failed: %r" % (e,))
+
+
+_run_cached_update_if_any()
 
 
 def _force_x64_arch_on_arm():
@@ -3060,6 +3080,8 @@ def main():
     _log_file("YT Mini 시작 — version %s (frozen=%s, updated=%s)"
               % (VERSION, getattr(sys, "frozen", False),
                  bool(os.environ.get("YTMINI_RUNNING_UPDATE"))))
+    # 최신본은 백그라운드로 받아 '다음 실행'에 적용 — 시작이 느려지지 않게
+    threading.Thread(target=_background_update_fetch, daemon=True).start()
     # ARM Windows(에뮬레이션 실행)에서 win-arm64 인터롭 DLL 을 못 찾아
     # webview.start 가 죽는 문제 방지 — 반드시 창 생성/start 전에 적용
     _patch_pywebview_arch()
