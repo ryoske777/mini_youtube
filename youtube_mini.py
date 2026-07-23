@@ -56,7 +56,7 @@ from ctypes import wintypes
 
 # 배포 버전. 새 코드를 main 브랜치에 올릴 때마다 반드시 올려야(증가) 자동
 # 업데이트가 인식한다. 형식은 자유지만 숫자가 커지는 방향으로.
-VERSION = "2026.07.21.1"
+VERSION = "2026.07.21.2"
 
 # 자동 업데이트 소스 — main 브랜치의 youtube_mini.py (raw, 공개 접근).
 # 사용자에게 배포하려면 변경사항을 main 에 병합/푸시하고 VERSION 을 올린다.
@@ -766,100 +766,56 @@ MINI_HOOK_JS = r"""
   grip.addEventListener('pointerup', function(){ resizing = false; });
   grip.addEventListener('pointercancel', function(){ resizing = false; });
 
-  // ---- 광고 '건너뛰기 버튼' 자동 클릭 (안전 모드) ----
-  // 실드가 클릭을 막아 화면의 '건너뛰기' 버튼을 직접 누를 수 없으므로,
-  // 버튼이 뜨면 JS 로 대신 눌러준다. 이것은 사람이 버튼을 누르는 것과
-  // 동일한 동작이며, 광고를 강제로 끝내거나(fast-forward) 네트워크 단에서
-  // 차단하지 않는다 — 계정/약관 관점에서 가장 안전한 방식.
-  // 유튜브 버전마다 클래스명이 달라, ytp-ad-skip / ytp-skip-ad 를 포함하는
-  // 요소를 폭넓게(부분일치) 잡는다. 컨테이너(div)가 잡혀도 실제 버튼을
-  // 안(자손)이나 밖(조상)에서 찾아 누른다.
-  var SKIP_SEL = [
-    '[class*="ytp-ad-skip-button"]',
-    '[class*="ytp-skip-ad-button"]',
-    '[id^="skip-button"]',
-    '.ytp-ad-skip-button-container',
-    '.videoAdUiSkipButton'
-  ].join(',');
-  function realButton(el){
-    if (!el) return null;
-    if (el.tagName === 'BUTTON') return el;
-    var inner = el.querySelector && el.querySelector('button');
-    if (inner) return inner;                       // 컨테이너 안쪽 버튼
-    var up = el.closest && el.closest('button');
-    if (up) return up;                             // 텍스트/아이콘의 바깥 버튼
-    return el;                                     // 버튼이 따로 없으면 자기 자신
-  }
-  function fire(el){
-    if (!el) return;
-    var b = realButton(el);
-    if (!b) return;
-    // click() 만으로 안 먹는 경우가 있어 포인터/마우스 이벤트도 함께 보낸다
-    try { b.click(); } catch(e){}
-    try {
-      ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(function(t){
-        b.dispatchEvent(new MouseEvent(t, {bubbles:true, cancelable:true, view:window}));
-      });
-    } catch(e){}
+  // ---- 광고 자동 건너뛰기 ----
+  // 확인 결과, 현재 유튜브의 '건너뛰기' 버튼은 스크립트 클릭(합성 이벤트)을
+  // 무시한다(사람의 실제 클릭만 인식). 실드 때문에 사람 클릭도 불가하므로,
+  // 실질적으로 광고를 넘기는 유일한 방법은 '광고 재생 중'에 광고 영상을
+  // 끝으로 보내는 것이다. '#movie_player.ad-showing' 일 때만 동작하므로 본
+  // 영상은 절대 건드리지 않는다. 네트워크 차단(애드블록)이 아니라서
+  // '광고 차단기 감지' 팝업 대상도 아니다. (config.json 의 "adFastSkip":false
+  // 로 끌 수 있음. 기본 켜짐)
+  var AD_FF = __ADFF__;
+  function isSkipEl(el){
+    var s = ((el.textContent || '') + ' '
+             + (el.getAttribute('aria-label') || '')).trim();
+    if (/자세히|learn\s*more/i.test(s)) return false;  // '자세히보기'(Learn more) 제외
+    if (/건너뛰기/.test(s)) return true;
+    if (/\bskip\b/i.test(s)) return true;
+    return false;
   }
   function handleAds(){
-    try {
-      // A) 클래스/ID 로 건너뛰기 버튼 잡기 (여러 개면 모두 시도)
-      var nodes = document.querySelectorAll(SKIP_SEL);
-      for (var i = 0; i < nodes.length; i++){ fire(nodes[i]); }
-      // B) 텍스트/aria 로 잡기 — 클래스명이 바뀌어도 '건너뛰기'/'Skip' 라벨로
-      //    확실히 찾는다. 플레이어/광고 영역 안의 버튼만 대상으로 오작동 방지.
-      var scope = document.querySelector('#movie_player')
-               || document.querySelector('.html5-video-player') || document;
-      var cands = scope.querySelectorAll('button, [role="button"]');
-      for (var j = 0; j < cands.length; j++){
-        var el = cands[j];
-        var lbl = ((el.textContent || '') + ' '
-                   + (el.getAttribute('aria-label') || '')).toLowerCase();
-        var cls = (el.className || '') + '';
-        if (lbl.indexOf('건너뛰기') >= 0 || /\bskip\b/.test(lbl)
-            || /skip/i.test(cls)){
-          fire(el);
-        }
-      }
-      // C) 하단 배너 오버레이 광고의 닫기(X)
-      var close = document.querySelector('.ytp-ad-overlay-close-button');
-      if (close){ fire(close); }
-    } catch(e){}
-  }
-  setInterval(handleAds, 400);
-
-  // ---- 광고 진단 로그 ----
-  // 광고가 뜨는데도 안 넘어가면, 그 순간 화면의 버튼들이 어떻게 생겼는지
-  // (클래스/aria/텍스트) 로그에 한 번 남긴다. 이걸로 정확한 스킵 버튼
-  // 선택자를 알아낼 수 있다. (광고 하나당 1회, 3초 뒤에도 광고면 기록)
-  var adDiagShown = false, adFirstSeen = 0;
-  function adDiag(){
     try {
       var player = document.querySelector('#movie_player')
                 || document.querySelector('.html5-video-player');
       var adShowing = !!(player && player.classList
                          && player.classList.contains('ad-showing'));
-      if (!adShowing){ adDiagShown = false; adFirstSeen = 0; return; }
-      if (!adFirstSeen) adFirstSeen = Date.now();
-      if (adDiagShown || Date.now() - adFirstSeen < 3000) return;
-      adDiagShown = true;
+      // 1) 진짜 '건너뛰기' 버튼은 눌러도 본다(사람 클릭이 먹는 환경 대비).
+      //    '자세히보기(Learn more)'는 제외 — 잘못 누르면 광고 링크가 열린다.
       var scope = player || document;
-      var btns = scope.querySelectorAll('button, [role="button"], a');
-      var info = [];
-      for (var i = 0; i < btns.length && info.length < 30; i++){
-        var b = btns[i];
-        var cls = (b.getAttribute && b.getAttribute('class')) || '';
-        var al = (b.getAttribute && b.getAttribute('aria-label')) || '';
-        var tx = ((b.textContent || '').trim()).slice(0, 24);
-        if (cls || al || tx)
-          info.push('[cls=' + cls + ' | al=' + al + ' | tx=' + tx + ']');
+      var cands = scope.querySelectorAll('button, [role="button"]');
+      for (var i = 0; i < cands.length; i++){
+        if (isSkipEl(cands[i])){
+          var el = cands[i];
+          var b = (el.tagName === 'BUTTON') ? el
+                : (el.querySelector && el.querySelector('button'))
+                || (el.closest && el.closest('button')) || el;
+          try { b.click(); } catch(e){}
+        }
       }
-      var a = api();
-      if (a) a.log('AD-DIAG buttons(' + btns.length + '): ' + info.join('  '));
+      // 2) 광고 재생 중이면 광고 영상을 끝으로 보내 즉시 종료 (본 영상 불변)
+      if (adShowing && AD_FF){
+        var v = document.querySelector('video');
+        if (v && isFinite(v.duration) && v.duration > 0
+            && v.currentTime < v.duration - 0.3){
+          try { v.currentTime = v.duration; } catch(e){}
+        }
+      }
+      // 3) 하단 배너 오버레이 광고의 닫기(X)
+      var close = document.querySelector('.ytp-ad-overlay-close-button');
+      if (close){ try { close.click(); } catch(e){} }
     } catch(e){}
   }
-  setInterval(adDiag, 1000);
+  setInterval(handleAds, 300);
 
   // 주기 작업: 자동재생(알고리즘 다음 영상) 켜기, 마지막 영상 저장,
   // 재생 불가 감지, 플레이어 리사이즈.
@@ -2241,6 +2197,10 @@ class Api:
                 "on": bool(self._config.get("stillOn", False)),
                 "sec": int(self._config.get("stillSec", 10)),
             }))
+            # 광고 자동 건너뛰기(광고 영상 빨리감기) 사용 여부 — 기본 켜짐
+            js = js.replace(
+                "__ADFF__",
+                "true" if self._config.get("adFastSkip", True) else "false")
             self._window.evaluate_js(js)
         except Exception:
             pass
