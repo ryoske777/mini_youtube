@@ -58,7 +58,7 @@ from ctypes import wintypes
 
 # 배포 버전. 새 코드를 main 브랜치에 올릴 때마다 반드시 올려야(증가) 자동
 # 업데이트가 인식한다. 형식은 자유지만 숫자가 커지는 방향으로.
-VERSION = "2026.07.21.5"
+VERSION = "2026.07.21.6"
 
 # 자동 업데이트 소스 — main 브랜치의 youtube_mini.py (raw, 공개 접근).
 # 사용자에게 배포하려면 변경사항을 main 에 병합/푸시하고 VERSION 을 올린다.
@@ -1075,10 +1075,11 @@ class Api:
         self._cham_visible = True
         self._cham_last_set = None      # 감시 스레드가 마지막으로 지정한 위치
         self._cham_thread = None
-        # 로드중 스플래시 (네이티브 WinForms — WebView2 안 씀)
+        # 로드중/업데이트중 스플래시 (네이티브 WinForms — WebView2 안 씀)
         self._splash = None
         self._splash_label = None
         self._splash_done = False
+        self._splash_text = "YouTube Mini\n로드중입니다..."
 
     def _persist_later(self, delay=0.5):
         if self._save_timer is not None:
@@ -2057,6 +2058,11 @@ class Api:
             _log_file("manual update save failed: %r" % (e,))
             box("업데이트 저장에 실패했어요:\n%r" % (e,), 0x30)
             return
+        # 창이 그냥 사라졌다 뜨지 않게 '업데이트 중' 오버레이를 덮고 잠깐 보여준 뒤
+        # 재시작한다 (재시작된 새 프로세스는 다시 '로드중' 오버레이를 띄운다).
+        self.hide_menu()
+        self._show_overlay("YouTube Mini\n업데이트 중입니다...")
+        time.sleep(0.8)
         # 재시작 시 업데이터가 캐시(최신본)를 실행하도록 억제 플래그 해제
         os.environ.pop("YTMINI_RUNNING_UPDATE", None)
         os.environ.pop("YTMINI_NOUPDATE", None)
@@ -2212,11 +2218,17 @@ class Api:
                         lbl.Font = Font("Malgun Gothic", 9.0)
                     except Exception:
                         pass
-                    lbl.Text = "YouTube Mini\n로드중입니다..."
+                    lbl.Text = self._splash_text
                     f.Controls.Add(lbl)
                     self._splash_label = lbl
                     self._splash = f
                 f = self._splash
+                # 현재 문구 반영 (로드중 ↔ 업데이트중 전환 지원)
+                try:
+                    if self._splash_label is not None:
+                        self._splash_label.Text = self._splash_text
+                except Exception:
+                    pass
                 try:
                     f.SetBounds(int(x), int(y), int(w), int(h))
                 except Exception:
@@ -2256,6 +2268,25 @@ class Api:
             self._splash = None
             self._splash_label = None
         self._on_ui_thread(fn)
+
+    def _show_overlay(self, text):
+        """미니 창 위에 지정 문구의 오버레이를 띄운다 (업데이트/재시작 등).
+
+        초기 로딩 스플래시와 같은 네이티브 오버레이를 재사용하되 문구만 바꾼다.
+        """
+        self._splash_text = text
+        self._splash_done = False   # 다시 표시 가능하게
+        try:
+            u = _user32()
+            mh = self._hwnd_of(self._window)
+            if u is not None and mh:
+                r = wintypes.RECT()
+                u.GetWindowRect(mh, ctypes.byref(r))
+                w, h = r.right - r.left, r.bottom - r.top
+                if w > 0 and h > 0:
+                    self._make_or_move_splash(r.left, r.top, w, h)
+        except Exception as e:
+            _log_file("show_overlay failed: %r" % (e,))
 
     def _splash_watch(self):
         """미니 창이 준비될 때까지 '로드중' 오버레이를 덮어둔다.
