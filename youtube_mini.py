@@ -58,7 +58,7 @@ from ctypes import wintypes
 
 # 배포 버전. 새 코드를 main 브랜치에 올릴 때마다 반드시 올려야(증가) 자동
 # 업데이트가 인식한다. 형식은 자유지만 숫자가 커지는 방향으로.
-VERSION = "2026.07.21.4"
+VERSION = "2026.07.21.5"
 
 # 자동 업데이트 소스 — main 브랜치의 youtube_mini.py (raw, 공개 접근).
 # 사용자에게 배포하려면 변경사항을 main 에 병합/푸시하고 VERSION 을 올린다.
@@ -645,6 +645,22 @@ MINI_HOOK_JS = r"""
     else { albumEl.style.display = 'none'; toast('영상 보기'); }
   }
 
+  // 자막(CC) 켜기/끄기 — 플레이어의 자막 버튼을 누른다.
+  function captionsBtn(){
+    return document.querySelector('.ytp-subtitles-button')
+        || document.querySelector('.ytp-caption-button');
+  }
+  function captionsOn(){
+    var b = captionsBtn();
+    return !!(b && b.getAttribute('aria-pressed') === 'true');
+  }
+  function toggleCaptions(){
+    var b = captionsBtn();
+    if (!b){ toast('이 영상엔 자막이 없어요'); return; }
+    b.click();
+    toast(captionsOn() ? '자막 켜짐' : '자막 꺼짐');
+  }
+
   function toWatchUrl(s){
     s = (s || '').trim();
     if (/^[A-Za-z0-9_-]{11}$/.test(s)) return 'https://www.youtube.com/watch?v=' + s;
@@ -697,6 +713,7 @@ MINI_HOOK_JS = r"""
     nextVideo: nextVideo, prevVideo: prevVideo,
     shuffleMusic: shuffleMusic, repeatMusic: repeatMusic, toggleAvMode: toggleAvMode,
     isAlbum: function(){ return albumOn; },
+    toggleCaptions: toggleCaptions, captionsOn: captionsOn,
     openUrl: openUrl, toast: toast, setStill: setStill
   };
 
@@ -910,7 +927,8 @@ MENU_HTML = r"""<!DOCTYPE html>
 <script>
   var api = function(){ return (window.pywebview && window.pywebview.api) || null; };
   var st = { playing: false, muted: false, onTop: true, opacity: 100,
-             cham: false, still: false, stillSec: 10, volume: 100, av: 'n' };
+             cham: false, still: false, stillSec: 10, volume: 100, av: 'n',
+             captions: false };
   // 화면 오른쪽 정리안대로 3그룹 + 하단 종료. 각 배열이 한 그룹(2열 그리드).
   var groups = [
     [   // 탐색 / 창
@@ -940,7 +958,8 @@ MENU_HTML = r"""<!DOCTYPE html>
       ['play',     function(){ return st.playing ? '일시정지' : '재생'; }],
       ['mute',     function(){ return st.muted ? '소리 켜기' : '음소거'; }],
       ['prev',     function(){ return '이전 영상'; }],
-      ['next',     function(){ return '다음영상'; }]
+      ['next',     function(){ return '다음영상'; }],
+      ['captions', function(){ return (st.captions ? '✓ ' : '') + '자막'; }]
     ]
   ];
   var g = document.getElementById('g');
@@ -1664,16 +1683,19 @@ class Api:
                     "var av='n';"
                     "if(location.host.indexOf('music.youtube.com')>=0){"
                     "av=(window.__mini&&__mini.isAlbum&&__mini.isAlbum())?'s':'v';}"
+                    "var cc=(window.__mini&&__mini.captionsOn&&__mini.captionsOn())"
+                    "?'1':'0';"
                     "return (v.paused?'0':'1')+(v.muted?'1':'0')"
-                    "+Math.round((v.volume||0)*100)+'|'+av;})()"
+                    "+Math.round((v.volume||0)*100)+'|'+av+'|'+cc;})()"
                 )
-                parts = (r or "").split("|", 1)
+                parts = (r or "").split("|")
                 s = parts[0]
                 state["playing"] = bool(s and s[0] == "1")
                 state["muted"] = bool(s and len(s) > 1 and s[1] == "1")
                 if s and len(s) > 2:
                     state["volume"] = max(0, min(100, int(s[2:])))
                 state["av"] = parts[1] if len(parts) > 1 else "n"
+                state["captions"] = bool(len(parts) > 2 and parts[2] == "1")
             except Exception:
                 pass
         if not self._menu_ok or not self._menu_open:
@@ -1752,6 +1774,7 @@ class Api:
             "shuffle": "window.__mini && __mini.shuffleMusic()",
             "repeat": "window.__mini && __mini.repeatMusic()",
             "avmode": "window.__mini && __mini.toggleAvMode()",
+            "captions": "window.__mini && __mini.toggleCaptions()",
         }
         try:
             if name in page_calls:
