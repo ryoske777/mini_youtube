@@ -812,6 +812,12 @@ MINI_HOOK_JS = r"""
   // '광고 차단기 감지' 팝업 대상도 아니다. (config.json 의 "adFastSkip":false
   // 로 끌 수 있음. 기본 켜짐)
   var AD_FF = __ADFF__;
+  // 광고 시작/종료 시점에 강제 seek(광고 건너뛰기)와 유튜브 자체의 비동기
+  // 광고→본편 전환이 겹치면서 오디오가 잠깐 끊기는 문제가 있었다. 이를
+  // 막기 위해 (a) 광고 재생 중에는 음소거해 그 경계의 잡음을 아예 없애고
+  // (b) 광고 하나당 강제 seek을 한 번만 실행해 재전환 도중 반복 발동을 막는다.
+  var __adMuteState = null;   // 광고 진입 시 사용자의 기존 음소거 상태 저장
+  var __adSeekDone = false;   // 현재 광고에 대해 이미 강제 종료를 실행했는지
   function isSkipEl(el){
     var s = ((el.textContent || '') + ' '
              + (el.getAttribute('aria-label') || '')).trim();
@@ -826,6 +832,21 @@ MINI_HOOK_JS = r"""
                 || document.querySelector('.html5-video-player');
       var adShowing = !!(player && player.classList
                          && player.classList.contains('ad-showing'));
+      var v = document.querySelector('video');
+
+      if (adShowing){
+        // 광고 진입: 기존 음소거 상태를 한 번만 저장하고 광고 동안 음소거
+        if (v && __adMuteState === null){
+          __adMuteState = { wasMuted: v.muted };
+          v.muted = true;
+        }
+      } else if (__adMuteState !== null){
+        // 광고 종료: 사용자가 원래 음소거하지 않았다면 복원
+        if (v && !__adMuteState.wasMuted) v.muted = false;
+        __adMuteState = null;
+        __adSeekDone = false;
+      }
+
       // 1) 진짜 '건너뛰기' 버튼은 눌러도 본다(사람 클릭이 먹는 환경 대비).
       //    '자세히보기(Learn more)'는 제외 — 잘못 누르면 광고 링크가 열린다.
       var scope = player || document;
@@ -840,11 +861,11 @@ MINI_HOOK_JS = r"""
         }
       }
       // 2) 광고 재생 중이면 광고 영상을 끝으로 보내 즉시 종료 (본 영상 불변)
-      if (adShowing && AD_FF){
-        var v = document.querySelector('video');
+      //    같은 광고에 대해 한 번만 실행해 전환 도중 재발동을 막는다.
+      if (adShowing && AD_FF && !__adSeekDone){
         if (v && isFinite(v.duration) && v.duration > 0
             && v.currentTime < v.duration - 0.3){
-          try { v.currentTime = v.duration; } catch(e){}
+          try { v.currentTime = v.duration; __adSeekDone = true; } catch(e){}
         }
       }
       // 3) 하단 배너 오버레이 광고의 닫기(X)
