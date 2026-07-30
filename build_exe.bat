@@ -2,16 +2,19 @@
 setlocal
 
 REM ============================================================
-REM  Build YTMini (one-folder / onedir).
+REM  Build YTMini (single-file / onefile).
 REM  - Run this on a PC that has Python installed.
-REM  - Output: dist\YTMini\  (folder with YTMini.exe + files)
-REM    Run dist\YTMini\YTMini.exe. Distribute by zipping the folder.
-REM  - Why onedir: onefile unpacks to a temp dir (_MEIxxxx) each run
-REM    and deletes it on exit; a lingering WebView2 child makes that
-REM    delete fail with "Failed to remove temporary directory".
-REM    onedir has no temp dir, so that warning never happens, and it
-REM    starts faster. The app's built-in auto-update keeps the code
-REM    current, so you only distribute the folder once.
+REM  - Output: dist\YTMini.exe  (single file, no _internal folder needed).
+REM    Run dist\YTMini.exe directly. Distribute by copying that one file.
+REM  - onefile unpacks to a temp dir (%TEMP%\_MEIxxxx) on each run and
+REM    removes it on exit. Older builds used onedir to dodge a bug where
+REM    a lingering WebView2 child process ("msedgewebview2.exe") locked
+REM    that temp dir and caused "Failed to remove temporary directory".
+REM    The app now explicitly kills WebView2 child processes and waits
+REM    before exiting (see _kill_descendants() in youtube_mini.py), so
+REM    onefile no longer hits that warning.
+REM  - Startup is slightly slower than onedir (extraction each launch).
+REM    The app's built-in auto-update keeps the code current either way.
 REM  - Target PC only needs the WebView2 runtime
 REM    (preinstalled on most Windows 10/11 systems).
 REM  - Uses "python -m ..." so it also works with Microsoft Store
@@ -48,19 +51,15 @@ if exist icon.ico (
 )
 
 echo.
-echo Building YTMini (onedir) ...
-python -m PyInstaller --onedir --noconsole --clean --name YTMini %ICON_OPTS% --hidden-import webview.platforms.winforms --hidden-import webview.platforms.edgechromium --collect-all webview --collect-binaries webview youtube_mini.py
+echo Building YTMini (onefile) ...
+python -m PyInstaller --onefile --noconsole --clean --name YTMini %ICON_OPTS% --hidden-import webview.platforms.winforms --hidden-import webview.platforms.edgechromium --collect-all webview --collect-binaries webview youtube_mini.py
 if errorlevel 1 goto fail
 
 echo.
-echo Zipping dist\YTMini into dist\YTMini.zip ...
-powershell -NoProfile -Command "if (Test-Path 'dist\YTMini') { Compress-Archive -Path 'dist\YTMini\*' -DestinationPath 'dist\YTMini.zip' -Force }" 2>nul
-
-echo.
 echo ============================================
-echo  Done!  Output folder: dist\YTMini\
-echo  Run:  dist\YTMini\YTMini.exe
-echo  Distribute: dist\YTMini.zip  (unzip, run YTMini.exe)
+echo  Done!  Output file: dist\YTMini.exe
+echo  Run:  dist\YTMini.exe
+echo  Distribute: just copy dist\YTMini.exe (no other files needed).
 echo ============================================
 pause
 exit /b 0
