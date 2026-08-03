@@ -60,7 +60,7 @@ from ctypes import wintypes
 
 # 배포 버전. 새 코드를 main 브랜치에 올릴 때마다 반드시 올려야(증가) 자동
 # 업데이트가 인식한다. 형식은 자유지만 숫자가 커지는 방향으로.
-VERSION = "2026.08.03.1"
+VERSION = "2026.08.03.2"
 
 # 자동 업데이트 소스 — main 브랜치의 youtube_mini.py (raw, 공개 접근).
 # 사용자에게 배포하려면 변경사항을 main 에 병합/푸시하고 VERSION 을 올린다.
@@ -1339,7 +1339,7 @@ class Api:
             _kill_descendants()
             # 자식이 _MEI 임시폴더 핸들을 놓을 시간을 준 뒤 종료 —
             # 곧바로 나가면 PyInstaller 부트로더가 삭제에 실패해 경고가 뜬다
-            time.sleep(1.0)
+            _wait_webview_children_gone()
             os._exit(0)
 
         t = threading.Timer(1.2, _final_exit)
@@ -2518,6 +2518,22 @@ def _has_webview_children():
         return False
 
 
+def _wait_webview_children_gone(timeout=5.0, poll=0.2):
+    """WebView2 자식이 완전히 내려갈 때까지(최대 timeout 초) 대기.
+
+    종료 직전 고정 sleep(1.0) 한 번으로는, 백신 실시간 검사나 시스템 부하로
+    자식 종료·핸들 해제가 늦어질 때 부족할 수 있어 '임시폴더 삭제 실패'
+    경고로 이어졌다(특히 exe 를 새 경로로 옮긴 직후 — Defender 가 낯선
+    경로의 파일을 다시 검사하며 잠깐 더 오래 잠근다). 실제로 다 내려갔는지
+    확인하며 기다리고, 그래도 안 내려가면 timeout 에서 포기하고 진행한다.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _has_webview_children():
+            return
+        time.sleep(poll)
+
+
 def _kill_descendants(names=("msedgewebview2.exe",)):
     """현재 프로세스의 WebView2 자식을 종료해 프로필/임시폴더 잠금을 푼다.
 
@@ -2703,7 +2719,7 @@ def _relaunch():
             _MUTEX = None
     except Exception:
         pass
-    time.sleep(1.0)   # 자식 프로세스가 완전히 내려가 프로필 잠금이 풀릴 때까지
+    _wait_webview_children_gone()   # 자식 프로세스가 완전히 내려가 프로필 잠금이 풀릴 때까지
     import subprocess
     try:
         if getattr(sys, "frozen", False):
@@ -3254,7 +3270,7 @@ def main():
     except Exception:
         pass
     _kill_descendants()
-    time.sleep(1.0)   # 자식이 _MEI 핸들을 놓을 시간 (임시폴더 삭제 실패 경고 방지)
+    _wait_webview_children_gone()   # 자식이 _MEI 핸들을 놓을 시간 (임시폴더 삭제 실패 경고 방지)
     os._exit(0)
 
 
