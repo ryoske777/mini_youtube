@@ -60,7 +60,7 @@ from ctypes import wintypes
 
 # 배포 버전. 새 코드를 main 브랜치에 올릴 때마다 반드시 올려야(증가) 자동
 # 업데이트가 인식한다. 형식은 자유지만 숫자가 커지는 방향으로.
-VERSION = "2026.07.29.1"
+VERSION = "2026.08.03.1"
 
 # 자동 업데이트 소스 — main 브랜치의 youtube_mini.py (raw, 공개 접근).
 # 사용자에게 배포하려면 변경사항을 main 에 병합/푸시하고 VERSION 을 올린다.
@@ -475,12 +475,30 @@ BROWSER_HOOK_JS = r"""
     var m = (href||'').match(/(?:youtu\.be\/|[?&]v=|shorts\/|live\/)([A-Za-z0-9_-]{11})/);
     return m ? m[1] : null;
   }
+  // 썸네일 링크는 대부분 Shadow DOM 안(ytd-thumbnail 등)에 있어 click 이
+  // document 까지 올라오면 e.target 이 컴포넌트 루트로 리타겟되어
+  // e.target.closest('a[href]') 가 실제 <a> 를 못 찾을 때가 있다. 이 경우
+  // 아래 가로채기가 조용히 실패해 유튜브 홈 창 자체가 그대로 네비게이션되어
+  // 영상이 재생되고, 그걸 아래 setInterval 폴백이 뒤늦게 감지해 미니로도
+  // 넘기면서 두 창에서 동시에 재생되는 문제가 있었다. composedPath() 로
+  // 섀도우 경계를 관통해 실제 <a> 를 찾아 가로채기를 확실히 한다.
+  function anchorFrom(e){
+    if (e.composedPath){
+      var path = e.composedPath();
+      for (var i = 0; i < path.length; i++){
+        var el = path[i];
+        if (el && el.tagName === 'A' && el.href) return el;
+      }
+    }
+    return e.target && e.target.closest ? e.target.closest('a[href]') : null;
+  }
   document.addEventListener('click', function(e){
-    var a = e.target && e.target.closest ? e.target.closest('a[href]') : null;
+    var a = anchorFrom(e);
     if (!a) return;
     var id = idFrom(a.href);
     if (!id) return;
     e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
+    window.__miniSent = true;
     if (window.pywebview && window.pywebview.api)
       window.pywebview.api.play_in_mini(a.href);
   }, true);
@@ -2365,6 +2383,17 @@ class Api:
             url = new
         try:
             if self._browser is not None and self._browser in webview.windows:
+                # 클릭 가로채기가 실패해 브라우저 창 자체가 먼저 재생을
+                # 시작했을 수 있으므로, 숨기기 전에 반드시 정지시킨다.
+                # hide() 는 창을 감출 뿐 재생 중인 <video>(소리 포함)는
+                # 멈추지 않아 미니 창과 동시에 재생되는 원인이 됐다.
+                try:
+                    self._browser.evaluate_js(
+                        "try{document.querySelectorAll('video').forEach("
+                        "function(v){v.pause();});}catch(e){}"
+                    )
+                except Exception:
+                    pass
                 self._browser.hide()
         except Exception:
             pass
