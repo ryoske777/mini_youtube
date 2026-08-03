@@ -60,7 +60,7 @@ from ctypes import wintypes
 
 # 배포 버전. 새 코드를 main 브랜치에 올릴 때마다 반드시 올려야(증가) 자동
 # 업데이트가 인식한다. 형식은 자유지만 숫자가 커지는 방향으로.
-VERSION = "2026.08.03.2"
+VERSION = "2026.08.03.3"
 
 # 자동 업데이트 소스 — main 브랜치의 youtube_mini.py (raw, 공개 접근).
 # 사용자에게 배포하려면 변경사항을 main 에 병합/푸시하고 VERSION 을 올린다.
@@ -838,6 +838,8 @@ MINI_HOOK_JS = r"""
   // (b) 광고 하나당 강제 seek을 한 번만 실행해 재전환 도중 반복 발동을 막는다.
   var __adMuteState = null;   // 광고 진입 시 사용자의 기존 음소거 상태 저장
   var __adSeekDone = false;   // 현재 광고에 대해 이미 강제 종료를 실행했는지
+  var __adLastTime = -1;      // 직전에 관측한 광고 재생시간 — 광고 묶음(pod) 안에서
+                               // 다음 광고로 넘어간 시점을 감지하는 데 쓴다
   function isSkipEl(el){
     var s = ((el.textContent || '') + ' '
              + (el.getAttribute('aria-label') || '')).trim();
@@ -860,11 +862,22 @@ MINI_HOOK_JS = r"""
           __adMuteState = { wasMuted: v.muted };
           v.muted = true;
         }
+        // 광고가 여러 개 연속으로 붙은 묶음(1/3, 2/3, 3/3 …)일 때는 그
+        // 사이에 ad-showing 클래스가 꺼지지 않고 광고 영상만 바뀐다. 이
+        // 경우 아래 else 분기(광고 완전 종료)가 안 타서 __adSeekDone 이
+        // 이전 광고 값 그대로 남아 두 번째 광고부터는 강제 건너뛰기가
+        // 동작하지 않았다. 재생시간이 이전보다 갑자기 줄면(새 영상이
+        // 0부터 시작) 같은 묶음 안의 다음 광고로 판단해 다시 허용한다.
+        if (v && __adLastTime >= 0 && v.currentTime < __adLastTime - 1){
+          __adSeekDone = false;
+        }
+        if (v) __adLastTime = v.currentTime;
       } else if (__adMuteState !== null){
         // 광고 종료: 사용자가 원래 음소거하지 않았다면 복원
         if (v && !__adMuteState.wasMuted) v.muted = false;
         __adMuteState = null;
         __adSeekDone = false;
+        __adLastTime = -1;
       }
 
       // 1) 진짜 '건너뛰기' 버튼은 눌러도 본다(사람 클릭이 먹는 환경 대비).
