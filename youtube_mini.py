@@ -42,8 +42,9 @@
     상대 위치를 유지하며 따라간다 (Windows 전용)
 
 저장:
-  창 크기/위치, 항상 위, 불투명도, 마지막 시청 영상이
+  창 위치, 항상 위, 불투명도, 마지막 시청 영상이
   ~/.yt_mini_profile/config.json 에 저장되어 재실행 후에도 이어서 사용.
+  창 크기는 저장하지 않음 — 항상 기본 크기로 시작(메뉴 '기본 크기'와 동일).
 
 로그인:
   크롬 로그인과는 별개(WebView2 자체 프로필 사용). YT 홈/구독 창에서
@@ -60,7 +61,7 @@ from ctypes import wintypes
 
 # 배포 버전. 새 코드를 main 브랜치에 올릴 때마다 반드시 올려야(증가) 자동
 # 업데이트가 인식한다. 형식은 자유지만 숫자가 커지는 방향으로.
-VERSION = "2026.08.03.3"
+VERSION = "2026.08.03.4"
 
 # 자동 업데이트 소스 — main 브랜치의 youtube_mini.py (raw, 공개 접근).
 # 사용자에게 배포하려면 변경사항을 main 에 병합/푸시하고 VERSION 을 올린다.
@@ -241,7 +242,7 @@ _force_x64_arch_on_arm()
 
 import webview
 
-BASE_W, BASE_H = 226, 126   # 최초 실행 기본 크기 (이후엔 저장된 크기 사용)
+BASE_W, BASE_H = 226, 126   # 항상 이 크기로 시작 (창 크기는 저장하지 않음)
 # 크기 조절 하한 — 가로/세로 모두 극한까지. 우측 하단 손잡이(16px)를
 # 다시 잡아 되돌릴 수 있는 최소한의 크기만 남긴다.
 MIN_W, MIN_H = 24, 20
@@ -1156,11 +1157,12 @@ class Api:
         _log_file(msg)
 
     def on_geometry_change(self, *args):
-        """창 크기/위치 변경 시 저장 (resized/moved 이벤트)."""
+        """창 위치 변경 시 저장 (resized/moved 이벤트).
+
+        크기는 저장하지 않는다 — 다음 실행은 항상 기본 크기로 시작한다.
+        """
         try:
             self._config.update({
-                "width": self._window.width,
-                "height": self._window.height,
                 "x": self._window.x,
                 "y": self._window.y,
             })
@@ -1289,13 +1291,15 @@ class Api:
             pass
 
     def set_scale(self, scale):
+        # 크기는 저장하지 않는다 — 다음 실행은 항상 기본 크기로 시작한다.
         w, h = BASE_W * int(scale), BASE_H * int(scale)
         self._window.resize(w, h)
-        self._config.update({"width": w, "height": h})
-        self._persist_later()
 
     def resize_to(self, w, h):
-        """우측 하단 손잡이 드래그로 크기 조절."""
+        """우측 하단 손잡이 드래그로 크기 조절.
+
+        크기는 저장하지 않는다 — 다음 실행은 항상 기본 크기로 시작한다.
+        """
         try:
             w, h = max(MIN_W, int(w)), max(MIN_H, int(h))
             u = _user32()
@@ -1305,8 +1309,6 @@ class Api:
                                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE)
             else:
                 self._window.resize(w, h)
-            self._config.update({"width": w, "height": h})
-            self._persist_later()
         except Exception:
             pass
 
@@ -2961,12 +2963,12 @@ def _keep_mini_injected(api):
                     api._persist_later()
         except Exception:
             pass
-        # 크기/위치 폴링 저장 — moved/resized 이벤트가 없는 환경이나
-        # 네이티브 드래그(OS 가 직접 이동)에서도 확실히 저장되게 한다
+        # 위치 폴링 저장 — moved 이벤트가 없는 환경이나 네이티브 드래그
+        # (OS 가 직접 이동)에서도 확실히 저장되게 한다. 크기는 저장하지
+        # 않는다 — 다음 실행은 항상 기본 크기로 시작한다.
         try:
             w = api._window
-            geo = {"width": int(w.width), "height": int(w.height),
-                   "x": int(w.x), "y": int(w.y)}
+            geo = {"x": int(w.x), "y": int(w.y)}
             if any(api._config.get(k) != v for k, v in geo.items()):
                 api._config.update(geo)
                 api._persist_later()
@@ -3125,33 +3127,22 @@ def _pos_on_screen(x, y, w, h):
     return False
 
 
-def _valid_geometry(cfg):
-    """저장된 창 크기/위치를 검증해 (width, height, x|None, y|None) 반환.
+def _valid_position(cfg):
+    """저장된 창 위치를 검증해 (x, y) 또는 (None, None) 반환.
 
-    - 기본값은 '기본 크기' 메뉴와 동일한 BASE_W x BASE_H.
-    - 사용자가 저장한 크기가 있으면 그대로 사용한다.
-    - 값이 손상됐으면(정수 아님/0 이하/비현실적으로 큼) 기본 크기로 되돌린다.
-      (손잡이로 줄인 작은 값 >=MIN 은 사용자의 선택이므로 존중한다.)
-    - 위치가 완전히 화면 밖이면 폐기(None)해 자동 배치되게 한다.
+    창 크기는 항상 BASE_W x BASE_H 로 시작하므로(손잡이로 줄인 크기는
+    저장하지 않음) 위치만 검증하면 된다. 위치가 완전히 화면 밖이면
+    폐기(None)해 자동 배치되게 한다.
     """
-    try:
-        w = int(cfg.get("width", BASE_W))
-        h = int(cfg.get("height", BASE_H))
-    except (TypeError, ValueError):
-        w, h = BASE_W, BASE_H
-    if not (MIN_W <= w <= 20000) or not (MIN_H <= h <= 20000):
-        _log_file("저장된 창 크기가 이상해 기본 크기로 복원 (w=%r h=%r)"
-                  % (cfg.get("width"), cfg.get("height")))
-        w, h = BASE_W, BASE_H
     x, y = cfg.get("x"), cfg.get("y")
     try:
         x, y = int(x), int(y)
     except (TypeError, ValueError):
-        return w, h, None, None
-    if not _pos_on_screen(x, y, w, h):
+        return None, None
+    if not _pos_on_screen(x, y, BASE_W, BASE_H):
         _log_file("저장된 창 위치가 화면 밖이라 자동 배치 (x=%d y=%d)" % (x, y))
-        return w, h, None, None
-    return w, h, x, y
+        return None, None
+    return x, y
 
 
 def main():
@@ -3190,8 +3181,6 @@ def main():
     # webview.start 가 죽는 문제 방지 — 반드시 창 생성/start 전에 적용
     _patch_pywebview_arch()
 
-    # 설정 파일 존재 여부로 '최초 실행'을 판정 (config 를 쓰기 전에 확인).
-    first_run = not os.path.exists(CONFIG_PATH)
     cfg = load_config()
     # 이전 실행이 비정상 종료돼 우리 프로필을 잠근 채 남은 WebView2 프로세스를
     # 먼저 정리 — 이게 남아 있으면 이번 실행의 엔진 초기화도 실패해
@@ -3220,16 +3209,11 @@ def main():
     if cfg.get("lastUrl") and last_t > 5 and "t=" not in start_url:
         start_url += ("&" if "?" in start_url else "?") + "t=%ds" % max(0, last_t - 2)
 
-    # 창 크기/위치 결정:
-    #  - 최초 실행: 무조건 기본 크기(BASE)로 고정, 위치는 자동 배치.
-    #  - 이후 실행: 저장된 사용자 크기 사용, 손상/화면밖이면 다시 기본으로.
-    # 결정값을 설정에도 반영해 이후 저장/복원이 일관되게 한다.
-    if first_run:
-        win_w, win_h, win_x, win_y = BASE_W, BASE_H, None, None
-        _log_file("최초 실행 — 창 크기를 기본 크기로 고정 (%dx%d)" % (BASE_W, BASE_H))
-    else:
-        win_w, win_h, win_x, win_y = _valid_geometry(cfg)
-    cfg["width"], cfg["height"] = win_w, win_h
+    # 창 크기는 항상 기본 크기(BASE)로 시작 — 손잡이로 줄인 크기는 저장하지
+    # 않는다(창을 아주 작게 줄인 채로 재시작하면 로딩 중 레이아웃이 깨져
+    # 보이는 문제가 있었다). 위치만 저장된 값을 검증해 사용한다.
+    win_w, win_h = BASE_W, BASE_H
+    win_x, win_y = _valid_position(cfg)
     if win_x is None:
         cfg.pop("x", None)
         cfg.pop("y", None)
