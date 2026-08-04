@@ -60,7 +60,7 @@ from ctypes import wintypes
 
 # 배포 버전. 새 코드를 main 브랜치에 올릴 때마다 반드시 올려야(증가) 자동
 # 업데이트가 인식한다. 형식은 자유지만 숫자가 커지는 방향으로.
-VERSION = "2026.08.03.1"
+VERSION = "2026.08.03.3"
 
 # 자동 업데이트 소스 — main 브랜치의 youtube_mini.py (raw, 공개 접근).
 # 사용자에게 배포하려면 변경사항을 main 에 병합/푸시하고 VERSION 을 올린다.
@@ -838,6 +838,8 @@ MINI_HOOK_JS = r"""
   // (b) 광고 하나당 강제 seek을 한 번만 실행해 재전환 도중 반복 발동을 막는다.
   var __adMuteState = null;   // 광고 진입 시 사용자의 기존 음소거 상태 저장
   var __adSeekDone = false;   // 현재 광고에 대해 이미 강제 종료를 실행했는지
+  var __adLastTime = -1;      // 직전에 관측한 광고 재생시간 — 광고 묶음(pod) 안에서
+                               // 다음 광고로 넘어간 시점을 감지하는 데 쓴다
   function isSkipEl(el){
     var s = ((el.textContent || '') + ' '
              + (el.getAttribute('aria-label') || '')).trim();
@@ -860,11 +862,22 @@ MINI_HOOK_JS = r"""
           __adMuteState = { wasMuted: v.muted };
           v.muted = true;
         }
+        // 광고가 여러 개 연속으로 붙은 묶음(1/3, 2/3, 3/3 …)일 때는 그
+        // 사이에 ad-showing 클래스가 꺼지지 않고 광고 영상만 바뀐다. 이
+        // 경우 아래 else 분기(광고 완전 종료)가 안 타서 __adSeekDone 이
+        // 이전 광고 값 그대로 남아 두 번째 광고부터는 강제 건너뛰기가
+        // 동작하지 않았다. 재생시간이 이전보다 갑자기 줄면(새 영상이
+        // 0부터 시작) 같은 묶음 안의 다음 광고로 판단해 다시 허용한다.
+        if (v && __adLastTime >= 0 && v.currentTime < __adLastTime - 1){
+          __adSeekDone = false;
+        }
+        if (v) __adLastTime = v.currentTime;
       } else if (__adMuteState !== null){
         // 광고 종료: 사용자가 원래 음소거하지 않았다면 복원
         if (v && !__adMuteState.wasMuted) v.muted = false;
         __adMuteState = null;
         __adSeekDone = false;
+        __adLastTime = -1;
       }
 
       // 1) 진짜 '건너뛰기' 버튼은 눌러도 본다(사람 클릭이 먹는 환경 대비).
@@ -1339,7 +1352,7 @@ class Api:
             _kill_descendants()
             # 자식이 _MEI 임시폴더 핸들을 놓을 시간을 준 뒤 종료 —
             # 곧바로 나가면 PyInstaller 부트로더가 삭제에 실패해 경고가 뜬다
-            time.sleep(1.0)
+            _wait_webview_children_gone()
             os._exit(0)
 
         t = threading.Timer(1.2, _final_exit)
@@ -2518,6 +2531,22 @@ def _has_webview_children():
         return False
 
 
+def _wait_webview_children_gone(timeout=5.0, poll=0.2):
+    """WebView2 자식이 완전히 내려갈 때까지(최대 timeout 초) 대기.
+
+    종료 직전 고정 sleep(1.0) 한 번으로는, 백신 실시간 검사나 시스템 부하로
+    자식 종료·핸들 해제가 늦어질 때 부족할 수 있어 '임시폴더 삭제 실패'
+    경고로 이어졌다(특히 exe 를 새 경로로 옮긴 직후 — Defender 가 낯선
+    경로의 파일을 다시 검사하며 잠깐 더 오래 잠근다). 실제로 다 내려갔는지
+    확인하며 기다리고, 그래도 안 내려가면 timeout 에서 포기하고 진행한다.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _has_webview_children():
+            return
+        time.sleep(poll)
+
+
 def _kill_descendants(names=("msedgewebview2.exe",)):
     """현재 프로세스의 WebView2 자식을 종료해 프로필/임시폴더 잠금을 푼다.
 
@@ -2703,7 +2732,7 @@ def _relaunch():
             _MUTEX = None
     except Exception:
         pass
-    time.sleep(1.0)   # 자식 프로세스가 완전히 내려가 프로필 잠금이 풀릴 때까지
+    _wait_webview_children_gone()   # 자식 프로세스가 완전히 내려가 프로필 잠금이 풀릴 때까지
     import subprocess
     try:
         if getattr(sys, "frozen", False):
@@ -3254,7 +3283,7 @@ def main():
     except Exception:
         pass
     _kill_descendants()
-    time.sleep(1.0)   # 자식이 _MEI 핸들을 놓을 시간 (임시폴더 삭제 실패 경고 방지)
+    _wait_webview_children_gone()   # 자식이 _MEI 핸들을 놓을 시간 (임시폴더 삭제 실패 경고 방지)
     os._exit(0)
 
 
