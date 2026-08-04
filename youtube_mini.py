@@ -61,7 +61,7 @@ from ctypes import wintypes
 
 # 배포 버전. 새 코드를 main 브랜치에 올릴 때마다 반드시 올려야(증가) 자동
 # 업데이트가 인식한다. 형식은 자유지만 숫자가 커지는 방향으로.
-VERSION = "2026.08.03.4"
+VERSION = "2026.08.03.5"
 
 # 자동 업데이트 소스 — main 브랜치의 youtube_mini.py (raw, 공개 접근).
 # 사용자에게 배포하려면 변경사항을 main 에 병합/푸시하고 VERSION 을 올린다.
@@ -499,19 +499,26 @@ BROWSER_HOOK_JS = r"""
     var id = idFrom(a.href);
     if (!id) return;
     e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
-    window.__miniSent = true;
     if (window.pywebview && window.pywebview.api)
       window.pywebview.api.play_in_mini(a.href);
   }, true);
-  // 클릭 가로채기를 빠져나간 내비게이션(키보드 이동 등) 대비 감시
+  // 클릭 가로채기를 빠져나간 내비게이션(터치/포인터 기반 탭 처리, 키보드
+  // 이동 등) 대비 감시. __miniSent 는 '같은 영상 URL 에 대해 중복 호출
+  // 방지'용인데, 예전엔 한 번 켜지면 이 페이지가 살아있는 동안 계속 켜진
+  // 채로 남아 있었다 — 첫 영상은 클릭 가로채기로 성공(그래서 URL 이 안
+  // 바뀌어 이 감시는 안 켜짐)해도, 같은 창에서(홈 창을 새로 열지 않고)
+  // 두 번째 영상을 클릭했을 때 가로채기가 실패하면 이 감시마저 이미
+  // 켜진 플래그 때문에 다시는 동작하지 않아 홈 창이 자체 재생을 계속하며
+  // 미니와 동시 재생되는 문제가 있었다. 지금은 홈/검색 등 영상이 아닌
+  // 페이지로 돌아오면 매번 다시 풀어(재무장) 다음 영상도 잡아낸다.
   setInterval(function(){
     var id = idFrom(location.href);
-    if (id && !window.__miniSent){
-      window.__miniSent = true;
-      if (window.pywebview && window.pywebview.api)
-        window.pywebview.api.play_in_mini(location.href);
-    }
-  }, 500);
+    if (!id){ window.__miniSent = false; return; }
+    if (window.__miniSent) return;
+    window.__miniSent = true;
+    if (window.pywebview && window.pywebview.api)
+      window.pywebview.api.play_in_mini(location.href);
+  }, 300);
 })();
 """
 
@@ -1134,6 +1141,7 @@ class Api:
         self._splash = None
         self._splash_label = None
         self._splash_done = False
+        self._startup_size_synced = False   # 최초 로드 후 크기 보정 1회 실행 여부
 
     def _persist_later(self, delay=0.5):
         if self._save_timer is not None:
@@ -2364,6 +2372,19 @@ class Api:
         if self._config.get("udfResetCount"):
             self._config.update({"udfResetCount": 0})
             self._persist_later()
+        if not self._startup_size_synced:
+            # webview.create_window(width=, height=) 로 만든 창의 실제 물리
+            # 크기가 DPI 배율이 있는 화면에서 메뉴 '기본 크기'(set_scale →
+            # window.resize)가 만드는 크기와 미세하게 어긋나는 경우가 있었다.
+            # 최초 로드 직후 딱 한 번 '기본 크기'와 완전히 같은 경로로
+            # 다시 맞춰, 둘이 항상 정확히 같은 크기가 되게 한다. (이후
+            # 영상이 바뀔 때마다 오는 loaded 이벤트에서는 다시 하지 않음 —
+            # 사용자가 손잡이로 조절한 크기를 덮어쓰면 안 되므로.)
+            self._startup_size_synced = True
+            try:
+                self.set_scale(1)
+            except Exception:
+                pass
         self._inject_mini_hook()
 
     def _inject_mini_hook(self, window=None):
