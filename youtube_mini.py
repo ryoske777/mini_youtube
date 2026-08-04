@@ -61,7 +61,7 @@ from ctypes import wintypes
 
 # 배포 버전. 새 코드를 main 브랜치에 올릴 때마다 반드시 올려야(증가) 자동
 # 업데이트가 인식한다. 형식은 자유지만 숫자가 커지는 방향으로.
-VERSION = "2026.08.03.5"
+VERSION = "2026.08.03.6"
 
 # 자동 업데이트 소스 — main 브랜치의 youtube_mini.py (raw, 공개 접근).
 # 사용자에게 배포하려면 변경사항을 main 에 병합/푸시하고 VERSION 을 올린다.
@@ -2417,27 +2417,39 @@ class Api:
             if lm:
                 new += "&list=" + lm.group(1)
             url = new
-        try:
-            if self._browser is not None and self._browser in webview.windows:
-                # 클릭 가로채기가 실패해 브라우저 창 자체가 먼저 재생을
-                # 시작했을 수 있으므로, 숨기기 전에 반드시 정지시킨다.
-                # hide() 는 창을 감출 뿐 재생 중인 <video>(소리 포함)는
-                # 멈추지 않아 미니 창과 동시에 재생되는 원인이 됐다.
-                try:
-                    self._browser.evaluate_js(
-                        "try{document.querySelectorAll('video').forEach("
-                        "function(v){v.pause();});}catch(e){}"
-                    )
-                except Exception:
-                    pass
-                self._browser.hide()
-        except Exception:
-            pass
+        # 미니 전환을 최우선으로 처리한다. 이 메서드 자체가 브라우저 창
+        # (self._browser) 안의 JS 에서 window.pywebview.api.play_in_mini(...)
+        # 로 호출된 콜백이라, 아래에서 '같은' 브라우저 창에 동기(blocking)
+        # evaluate_js 를 또 걸면 그 창의 메시지 루프가 이 콜백이 끝나길
+        # 기다리는 상태와 맞물려 응답이 영영 안 오는 재진입 정체가 있었다
+        # (클릭해도 반응이 없다가, 그 창을 닫아 WebView2 가 강제 정리돼야
+        # 막혀 있던 전환이 뒤늦게 완료되는 증상으로 나타났다). 그래서 가장
+        # 중요한 '미니에서 재생 시작'을 먼저 끝내고, 브라우저 정리는 그
+        # 뒤에, evaluate_js 는 별도 스레드에서 fire-and-forget 으로 돌려
+        # 이 콜백이 절대 브라우저 자신의 응답을 기다리며 막히지 않게 한다.
         try:
             self._window.restore()
             self._window.load_url(url)
             self._config.update({"lastUrl": url})
             self._persist_later()
+        except Exception:
+            pass
+        browser = self._browser
+        try:
+            if browser is not None and browser in webview.windows:
+                browser.hide()
+                # 클릭 가로채기가 실패해 브라우저 창 자체가 먼저 재생을
+                # 시작했을 수 있으므로 정지시킨다 — hide() 는 창을 감출
+                # 뿐 재생 중인 <video>(소리 포함)는 멈추지 않는다.
+                def _pause_browser_video():
+                    try:
+                        browser.evaluate_js(
+                            "try{document.querySelectorAll('video').forEach("
+                            "function(v){v.pause();});}catch(e){}"
+                        )
+                    except Exception:
+                        pass
+                threading.Thread(target=_pause_browser_video, daemon=True).start()
         except Exception:
             pass
 
