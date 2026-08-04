@@ -61,7 +61,7 @@ from ctypes import wintypes
 
 # 배포 버전. 새 코드를 main 브랜치에 올릴 때마다 반드시 올려야(증가) 자동
 # 업데이트가 인식한다. 형식은 자유지만 숫자가 커지는 방향으로.
-VERSION = "2026.08.03.6"
+VERSION = "2026.08.03.7"
 
 # 자동 업데이트 소스 — main 브랜치의 youtube_mini.py (raw, 공개 접근).
 # 사용자에게 배포하려면 변경사항을 main 에 병합/푸시하고 VERSION 을 올린다.
@@ -3200,11 +3200,6 @@ def main():
         logging.getLogger("pywebview").addHandler(handler)
     except Exception:
         pass
-    # 사용자 클릭 없이도 소리 있는 자동재생을 허용 (WebView2 전용 플래그)
-    os.environ.setdefault(
-        "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
-        "--autoplay-policy=no-user-gesture-required",
-    )
     _log_file("YT Mini 시작 — version %s (frozen=%s, updated=%s)"
               % (VERSION, getattr(sys, "frozen", False),
                  bool(os.environ.get("YTMINI_RUNNING_UPDATE"))))
@@ -3215,6 +3210,33 @@ def main():
     _patch_pywebview_arch()
 
     cfg = load_config()
+    # WebView2 실행 플래그 — 엔진이 뜨기 전(webview.start 전)에 정해야 한다.
+    #  - autoplay-policy: 사용자 클릭 없이도 소리 있는 자동재생 허용
+    #  - disable-gpu-compositing: 불투명도를 쓰려면 필수.
+    #    Form.Opacity 가 1 미만이면 Windows 는 창을 레이어드 윈도우
+    #    (WS_EX_LAYERED)로 바꾸는데, WebView2 의 기본 GPU 합성
+    #    (DirectComposition)은 그 합성 경로에 실리지 않아 창이 통째로
+    #    투명해진다 — '불투명도를 낮추면 영상 창이 사라지는' 증상의 원인.
+    #    소프트웨어 합성으로 내리면 레이어드 윈도우와 호환돼 뒤가 비치는
+    #    진짜 반투명이 동작한다. 대신 합성이 CPU 로 내려와 부하가 조금
+    #    오르므로, 항상 100% 로만 쓴다면 config.json 에
+    #    "gpuCompositing": true 로 되돌릴 수 있다.
+    _args = ["--autoplay-policy=no-user-gesture-required"]
+    if not cfg.get("gpuCompositing", False):
+        _args.append("--disable-gpu-compositing")
+    os.environ.setdefault("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", " ".join(_args))
+    # GPU 합성을 켠 채로 반투명이 저장돼 있으면 창이 아예 안 보여 우클릭
+    # 메뉴조차 열 수 없다(= 되돌릴 방법이 없어 앱이 잠긴다). 그 조합일
+    # 때만 불투명도를 100 으로 되돌려 항상 조작 가능한 상태로 시작한다.
+    if cfg.get("gpuCompositing", False):
+        try:
+            if int(cfg.get("opacity", 100) or 100) < 100:
+                cfg["opacity"] = 100
+                save_config(cfg)
+                _log_file("gpuCompositing=true — 창이 안 보이지 않게"
+                          " 불투명도를 100 으로 복원")
+        except (TypeError, ValueError):
+            pass
     # 이전 실행이 비정상 종료돼 우리 프로필을 잠근 채 남은 WebView2 프로세스를
     # 먼저 정리 — 이게 남아 있으면 이번 실행의 엔진 초기화도 실패해
     # '프로필 복구 후 재시작'이 반복된다. (우리 WebView2 가 뜨기 전에 호출)
