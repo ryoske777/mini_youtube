@@ -46,6 +46,12 @@
   ~/.yt_mini_profile/config.json 에 저장되어 재실행 후에도 이어서 사용.
   창 크기는 저장하지 않음 — 항상 기본 크기로 시작(메뉴 '기본 크기'와 동일).
 
+진단 로그:
+  ~/.yt_mini_profile/mini.log 에 시작 단계별 '[boot]' 체크포인트가 남는다.
+  우클릭 '로그 보기' 창의 버튼 또는 트레이 아이콘 우클릭 '로그 저장 (txt)'
+  으로 최근 실행 5회분 + 환경 정보를 바탕화면 txt 로 저장한다
+  (시청 기록은 제외). WebView2 초기화 실패 시에는 자동 저장된다.
+
 로그인:
   크롬 로그인과는 별개(WebView2 자체 프로필 사용). YT 홈/구독 창에서
   한 번 로그인하면 유지되며, 추천 알고리즘도 계정 기준으로 적용된다.
@@ -61,7 +67,7 @@ from ctypes import wintypes
 
 # 배포 버전. 새 코드를 main 브랜치에 올릴 때마다 반드시 올려야(증가) 자동
 # 업데이트가 인식한다. 형식은 자유지만 숫자가 커지는 방향으로.
-VERSION = "2026.08.03.7"
+VERSION = "2026.10.23.2"
 
 # 자동 업데이트 소스 — main 브랜치의 youtube_mini.py (raw, 공개 접근).
 # 사용자에게 배포하려면 변경사항을 main 에 병합/푸시하고 VERSION 을 올린다.
@@ -72,12 +78,27 @@ UPDATE_RAW_URL = (
 )
 
 
+# 프로세스 시작 시각 — 로그의 '+N.NNs'(시작 후 경과)를 계산하는 기준.
+# 캐시된 업데이트 코드를 exec 으로 실행해도 이어지도록 환경변수로 넘긴다
+# (재시작용 Popen 전에는 반드시 지울 것 — _relaunch 참고).
+try:
+    _T0 = float(os.environ.setdefault("YTMINI_T0", repr(time.time())))
+except ValueError:
+    _T0 = time.time()
+
+
+def _log_stamp():
+    t = time.time()
+    return "%s.%03d +%6.2fs" % (time.strftime("%m-%d %H:%M:%S", time.localtime(t)),
+                                int(t * 1000) % 1000, t - _T0)
+
+
 def _upd_log(msg):
     try:
         d = os.path.join(os.path.expanduser("~"), ".yt_mini_profile")
         os.makedirs(d, exist_ok=True)
         with open(os.path.join(d, "mini.log"), "a", encoding="utf-8") as f:
-            f.write(time.strftime("%H:%M:%S") + " [update] " + str(msg) + "\n")
+            f.write(_log_stamp() + " [update] " + str(msg) + "\n")
     except Exception:
         pass
 
@@ -164,6 +185,7 @@ def _run_cached_update_if_any():
                 env = dict(os.environ)
                 env["YTMINI_NOUPDATE"] = "1"
                 env.pop("YTMINI_RUNNING_UPDATE", None)
+                env.pop("YTMINI_T0", None)
                 subprocess.Popen([sys.executable], env=env)
             except Exception:
                 pass
@@ -253,6 +275,7 @@ DEFAULT_URL = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
 
 PROFILE_DIR = os.path.join(os.path.expanduser("~"), ".yt_mini_profile")
 CONFIG_PATH = os.path.join(PROFILE_DIR, "config.json")
+LOG_PATH = os.path.join(PROFILE_DIR, "mini.log")
 
 YT_ID_RE = re.compile(r"(?:youtu\.be/|[?&]v=|shorts/|live/)([A-Za-z0-9_-]{11})")
 
@@ -406,6 +429,40 @@ def _work_area_at(x, y):
         return None
 
 
+def _window_rect(hwnd):
+    """창의 실제 화면 사각형 (x, y, w, h) — 물리 px. 실패 시 None.
+
+    pywebview 의 window.x/y/width/height 는 버전마다 단위가 다르다
+    (6.1 이하: 물리 px, 6.2+: 논리 px = 물리 / DPI 배율). Win32 API
+    (SetWindowPos/GetWindowRect/WindowFromPoint/작업영역)와 섞어 쓰는
+    계산은 반드시 이 값을 써야 배율 125%/150% 화면에서 어긋나지 않는다.
+    """
+    u = _user32()
+    if u is None or not hwnd:
+        return None
+    try:
+        r = wintypes.RECT()
+        if not u.GetWindowRect(hwnd, ctypes.byref(r)):
+            return None
+        return (r.left, r.top, r.right - r.left, r.bottom - r.top)
+    except Exception:
+        return None
+
+
+def _dpi_scale(hwnd=None):
+    """논리→물리 배율 (100% = 1.0). hwnd 가 있으면 그 창이 있는 모니터,
+    없으면 시스템(주 모니터) 기준. 알 수 없으면 1.0."""
+    try:
+        u = ctypes.windll.user32
+        dpi = (u.GetDpiForWindow(ctypes.c_void_p(hwnd)) if hwnd
+               else u.GetDpiForSystem())
+        if dpi:
+            return dpi / 96.0
+    except Exception:
+        pass
+    return 1.0
+
+
 def _win_title(u, hwnd):
     try:
         n = u.GetWindowTextLengthW(hwnd)
@@ -462,8 +519,193 @@ def _log_file(msg):
     """콘솔이 숨겨져 있어도 확인할 수 있는 진단 로그 (~/.yt_mini_profile/mini.log)."""
     try:
         os.makedirs(PROFILE_DIR, exist_ok=True)
-        with open(os.path.join(PROFILE_DIR, "mini.log"), "a", encoding="utf-8") as f:
-            f.write(time.strftime("%H:%M:%S") + " " + str(msg) + "\n")
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(_log_stamp() + " " + str(msg) + "\n")
+    except Exception:
+        pass
+
+
+def _boot(msg):
+    """시작 단계 체크포인트 로그 — '[boot]' 로 검색하면 어디서 멈췄는지 보인다."""
+    _log_file("[boot] " + str(msg))
+
+
+SESSION_MARK = "===== YT Mini 세션 시작"
+
+
+def _trim_log(max_bytes=1024 * 1024, keep_bytes=512 * 1024):
+    """로그가 너무 커지면 뒤쪽(최근)만 남긴다 — 시작 시 1회."""
+    try:
+        if os.path.getsize(LOG_PATH) <= max_bytes:
+            return
+        with open(LOG_PATH, "rb") as f:
+            f.seek(-keep_bytes, os.SEEK_END)
+            tail = f.read()
+        nl = tail.find(b"\n")
+        tail = tail[nl + 1:] if nl >= 0 else tail
+        tmp = LOG_PATH + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(tail)
+        os.replace(tmp, LOG_PATH)
+    except Exception:
+        pass
+
+
+def _reg_value(root, path, name):
+    try:
+        import winreg
+        with winreg.OpenKey(root, path) as k:
+            return winreg.QueryValueEx(k, name)[0]
+    except Exception:
+        return None
+
+
+def _webview2_runtime_version():
+    """설치된 WebView2 런타임 버전 (레지스트리). 없으면 None."""
+    try:
+        import winreg
+    except ImportError:
+        return None
+    guid = r"\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+    for root, path in (
+            (winreg.HKEY_LOCAL_MACHINE,
+             r"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients" + guid),
+            (winreg.HKEY_LOCAL_MACHINE,
+             r"SOFTWARE\Microsoft\EdgeUpdate\Clients" + guid),
+            (winreg.HKEY_CURRENT_USER,
+             r"Software\Microsoft\EdgeUpdate\Clients" + guid)):
+        v = _reg_value(root, path, "pv")
+        if v and v != "0.0.0.0":
+            return v
+    return None
+
+
+def _system_info_lines():
+    """문제 진단용 환경 정보 (개인정보 없음)."""
+    lines = ["app version: %s (frozen=%s, updated=%s)"
+             % (VERSION, getattr(sys, "frozen", False),
+                bool(os.environ.get("YTMINI_RUNNING_UPDATE")))]
+    try:
+        wv = sys.getwindowsversion()
+        build = wv.build
+        disp = None
+        try:
+            import winreg
+            cv = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+            disp = _reg_value(winreg.HKEY_LOCAL_MACHINE, cv, "DisplayVersion")
+            ubr = _reg_value(winreg.HKEY_LOCAL_MACHINE, cv, "UBR")
+            if ubr is not None:
+                build = "%s.%s" % (wv.build, ubr)
+        except Exception:
+            pass
+        lines.append("windows: %s build %s %s"
+                     % ("11" if wv.build >= 22000 else "10",
+                        build, disp or ""))
+    except Exception:
+        import platform
+        lines.append("os: %s" % platform.platform())
+    lines.append("arch: PROCESSOR_ARCHITECTURE=%s ARCHITEW6432=%s"
+                 % (os.environ.get("PROCESSOR_ARCHITECTURE"),
+                    os.environ.get("PROCESSOR_ARCHITEW6432")))
+    lines.append("python: %s" % sys.version.split()[0])
+    pwv = None
+    try:
+        from importlib import metadata as _md
+        pwv = _md.version("pywebview")
+    except Exception:
+        pwv = getattr(sys.modules.get("webview"), "__version__", None)
+    lines.append("pywebview: %s" % (pwv or "?"))
+    lines.append("webview2 runtime: %s" % (_webview2_runtime_version() or "없음/확인 불가"))
+    try:
+        u = ctypes.windll.user32
+        lines.append("dpi: system %d%%, monitors %d"
+                     % (round(_dpi_scale() * 100), u.GetSystemMetrics(80)))
+    except Exception:
+        pass
+    lines.append("profile: %s" % PROFILE_DIR)
+    return lines
+
+
+def _desktop_dir():
+    """바탕화면 폴더 (OneDrive 로 옮겨진 경우 포함). 없으면 프로필 폴더."""
+    try:
+        buf = ctypes.create_unicode_buffer(260)
+        # CSIDL_DESKTOPDIRECTORY = 0x10 — 폴더 리디렉션(OneDrive)도 반영된다
+        if (ctypes.windll.shell32.SHGetFolderPathW(None, 0x10, None, 0, buf) == 0
+                and os.path.isdir(buf.value)):
+            return buf.value
+    except Exception:
+        pass
+    p = os.path.join(os.path.expanduser("~"), "Desktop")
+    return p if os.path.isdir(p) else PROFILE_DIR
+
+
+def _export_log_txt(sessions=5, reason=""):
+    """최근 실행 몇 번 분량의 로그 + 환경 정보를 바탕화면 txt 로 저장.
+
+    '껐다 켰을 때 처음에만 생기는 문제'는 문제가 난 실행이 지난 뒤에야
+    내보내게 되므로, 현재 실행뿐 아니라 이전 실행(세션)들도 함께 담는다.
+    저장 경로를 반환 (실패 시 None).
+    """
+    try:
+        try:
+            with open(LOG_PATH, encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+        except Exception:
+            lines = []
+        starts = [i for i, ln in enumerate(lines) if SESSION_MARK in ln]
+        if len(starts) > sessions:
+            lines = lines[starts[-sessions]:]
+        lines = lines[-4000:]
+        cfg = load_config()
+        safe_cfg = {k: v for k, v in cfg.items()
+                    if k not in ("lastUrl", "lastTime")}   # 시청 기록은 제외
+        head = ["YT Mini 진단 로그",
+                "내보낸 시각: %s" % time.strftime("%Y-%m-%d %H:%M:%S")]
+        if reason:
+            head.append("사유: %s" % reason)
+        head += _system_info_lines()
+        head.append("config: %s" % json.dumps(safe_cfg, ensure_ascii=False))
+        head.append("-" * 60)
+        path = os.path.join(_desktop_dir(), "YTMini_log_%s.txt"
+                            % time.strftime("%Y%m%d_%H%M%S"))
+        with open(path, "w", encoding="utf-8-sig") as f:   # BOM: 메모장 호환
+            f.write("\n".join(head) + "\n")
+            f.writelines(lines)
+        _log_file("log exported: %s" % path)
+        return path
+    except Exception as e:
+        _log_file("log export failed: %r" % (e,))
+        return None
+
+
+def _reveal_in_explorer(path):
+    """탐색기에서 파일을 선택한 상태로 연다 (보낼 파일을 바로 찾게)."""
+    try:
+        import subprocess
+        subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+    except Exception:
+        pass
+
+
+def _install_crash_logging():
+    """잡히지 않은 예외(메인/백그라운드 스레드)의 트레이스백을 로그에 남긴다."""
+    import traceback
+
+    def _hook(exc_type, exc, tb):
+        _log_file("UNCAUGHT %s" % "".join(
+            traceback.format_exception(exc_type, exc, tb)).rstrip())
+
+    sys.excepthook = _hook
+    try:
+        def _thook(args):
+            if args.exc_type is SystemExit:
+                return
+            _log_file("UNCAUGHT in thread %s: %s" % (
+                getattr(args.thread, "name", "?"), "".join(
+                    traceback.format_exception(args.exc_type, args.exc_value,
+                                               args.exc_traceback)).rstrip()))
+        threading.excepthook = _thook
     except Exception:
         pass
 
@@ -776,7 +1018,11 @@ MINI_HOOK_JS = r"""
     var now = Date.now();
     if (now - dgLast < 16) return;
     dgLast = now;
-    var a = api(); if (a) a.move_delta(e.screenX - dgX, e.screenY - dgY);
+    // 파이썬은 물리 px(SetWindowPos)로 이동하므로 CSS px 이동량에 배율을 곱한다
+    var dpr = window.devicePixelRatio || 1;
+    var a = api();
+    if (a) a.move_delta(Math.round((e.screenX - dgX) * dpr),
+                        Math.round((e.screenY - dgY) * dpr));
   });
   shield.addEventListener('pointerup', function(){ dragging = false; });
   shield.addEventListener('pointercancel', function(){ dragging = false; });
@@ -826,7 +1072,12 @@ MINI_HOOK_JS = r"""
     var now = Date.now();
     if (now - rsLast < 33) return;
     rsLast = now;
-    var a = api(); if (a) a.resize_to(rsW + (e.screenX - rsX), rsH + (e.screenY - rsY));
+    // innerWidth/screenX 는 CSS px, resize_to 는 물리 px(SetWindowPos) —
+    // 배율 125%/150% 화면에서 손잡이를 잡자마자 창이 줄어들지 않게 변환
+    var dpr = window.devicePixelRatio || 1;
+    var a = api();
+    if (a) a.resize_to(Math.round((rsW + (e.screenX - rsX)) * dpr),
+                       Math.round((rsH + (e.screenY - rsY)) * dpr));
   });
   grip.addEventListener('pointerup', function(){ resizing = false; });
   grip.addEventListener('pointercancel', function(){ resizing = false; });
@@ -1142,6 +1393,7 @@ class Api:
         self._splash_label = None
         self._splash_done = False
         self._startup_size_synced = False   # 최초 로드 후 크기 보정 1회 실행 여부
+        self._start_pos = None    # 시작 시 정확히 맞출 저장 위치 (물리 px)
 
     def _persist_later(self, delay=0.5):
         if self._save_timer is not None:
@@ -1164,19 +1416,42 @@ class Api:
             pass
         _log_file(msg)
 
+    def _mini_rect(self):
+        """미니 창의 (x, y, w, h) — 물리 px (_window_rect 참고).
+        Windows API 를 못 쓰는 환경에서만 pywebview 값으로 대신한다."""
+        r = _window_rect(self._hwnd_of(self._window))
+        if r:
+            return r
+        w = self._window
+        return (int(w.x), int(w.y), int(w.width), int(w.height))
+
+    def _remember_pos(self):
+        """현재 창 위치(물리 px)를 px/py 로 저장 — 바뀐 경우에만.
+
+        예전 키 x/y 는 pywebview 단위(버전마다 물리/논리가 다름)라 그대로
+        되살리면 배율 화면에서 실행할 때마다 위치가 밀렸다. 물리 px 로
+        저장하고 시작 시 SetWindowPos 로 정확히 맞춘다 (main 참고).
+        """
+        try:
+            # 최소화 중엔 GetWindowRect 가 (-32000, -32000) 을 준다 — 저장 안 함
+            u = _user32()
+            mh = self._hwnd_of(self._window)
+            if u is not None and mh and u.IsIconic(mh):
+                return
+            x, y, _w, _h = self._mini_rect()
+            geo = {"px": int(x), "py": int(y)}
+            if any(self._config.get(k) != v for k, v in geo.items()):
+                self._config.update(geo)
+                self._persist_later()
+        except Exception:
+            pass
+
     def on_geometry_change(self, *args):
         """창 위치 변경 시 저장 (resized/moved 이벤트).
 
         크기는 저장하지 않는다 — 다음 실행은 항상 기본 크기로 시작한다.
         """
-        try:
-            self._config.update({
-                "x": self._window.x,
-                "y": self._window.y,
-            })
-            self._persist_later()
-        except Exception:
-            pass
+        self._remember_pos()
 
     def _on_ui_thread(self, fn):
         """WinForms UI 스레드에서 실행 (창 속성은 UI 스레드 전용)."""
@@ -1259,9 +1534,10 @@ class Api:
         self._on_ui_thread(lambda: setattr(native, "Opacity", pct / 100.0))
 
     def begin_move(self):
-        """실드 드래그 시작: 창의 시작 위치를 기억."""
+        """실드 드래그 시작: 창의 시작 위치(물리 px)를 기억."""
         try:
-            self._drag_origin = (self._window.x, self._window.y)
+            x, y, _w, _h = self._mini_rect()
+            self._drag_origin = (x, y)
         except Exception:
             self._drag_origin = (0, 0)
 
@@ -1280,9 +1556,9 @@ class Api:
             pass
 
     def move_delta(self, dx, dy):
-        """실드 드래그 중: 시작 위치 + 마우스 이동량으로 창 이동."""
+        """실드 드래그 중: 시작 위치 + 마우스 이동량(물리 px)으로 창 이동."""
         try:
-            ox, oy = getattr(self, "_drag_origin", (self._window.x, self._window.y))
+            ox, oy = getattr(self, "_drag_origin", None) or self._mini_rect()[:2]
             nx, ny = int(ox + dx), int(oy + dy)
             # UI 스레드(Invoke)를 거치지 않는 SetWindowPos 로 이동 —
             # UI 스레드가 바빠도/꼬여도 드래그는 항상 동작한다.
@@ -1293,8 +1569,7 @@ class Api:
                                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
             else:
                 self._window.move(nx, ny)
-            self._config.update({"x": nx, "y": ny})
-            self._persist_later()
+            self._remember_pos()
         except Exception:
             pass
 
@@ -1335,11 +1610,9 @@ class Api:
             save_config(self._config)
         except Exception:
             pass
-        # 트레이 아이콘이 잔류하지 않게 정리
+        # 트레이 아이콘이 잔류하지 않게 정리 (UI 스레드에서)
         try:
-            if self._notify is not None:
-                self._notify.Visible = False
-                self._notify.Dispose()
+            self._dispose_notify_icon()
         except Exception:
             pass
         for w in (self._menu, self._browser, self._logwin):
@@ -1414,8 +1687,9 @@ class Api:
         # 미니 창 중심점 아래에 있는 최상위 창을 호스트로 지정
         try:
             mini = self._hwnd_of(self._window)
-            cx = self._window.x + self._window.width // 2
-            cy = self._window.y + self._window.height // 2
+            mx, my, mw, mh = self._mini_rect()    # 물리 px (WindowFromPoint 와 같은 단위)
+            cx = mx + mw // 2
+            cy = my + mh // 2
             u.ShowWindow(mini, SW_HIDE)   # 자기 자신이 잡히지 않게 잠깐 숨김
             try:
                 hwnd = u.WindowFromPoint(wintypes.POINT(cx, cy))
@@ -1429,7 +1703,7 @@ class Api:
                 return
             rect = wintypes.RECT()
             u.GetWindowRect(host, ctypes.byref(rect))
-            self._cham_offset = (self._window.x - rect.left, self._window.y - rect.top)
+            self._cham_offset = (mx - rect.left, my - rect.top)
             self._cham_last_set = None
             # 현재 창 제목(=브라우저 탭)을 기억 — 탭이 바뀌면 제목이 바뀐다
             self._cham_title = _norm_title(_win_title(u, host))
@@ -1516,7 +1790,11 @@ class Api:
                 mini_shown = bool(u.IsWindowVisible(mini))
                 rect = wintypes.RECT()
                 u.GetWindowRect(host, ctypes.byref(rect))
-                cur = (self._window.x, self._window.y)
+                # 물리 px 로 비교 — pywebview 6.2+ 의 window.x 는 논리 px 라
+                # GetWindowRect 값과 섞으면 배율 화면에서 매 주기 '사용자가
+                # 옮겼다'로 오판해 창이 계속 튀었다
+                mr = _window_rect(mini) or self._mini_rect()
+                cur = (mr[0], mr[1])
                 # 유저가 미니를 직접 옮겼으면 상대 위치 재계산
                 if (mini_shown and self._cham_last_set is not None
                         and cur != self._cham_last_set):
@@ -1535,8 +1813,7 @@ class Api:
                     visible = False    # 브라우저 탭이 바뀜 (빈 제목은 판정 보류)
                 else:
                     region = (expect[0], expect[1],
-                              expect[0] + self._window.width,
-                              expect[1] + self._window.height)
+                              expect[0] + mr[2], expect[1] + mr[3])
                     if self._host_region_covered(u, host, region):
                         visible = False
 
@@ -1608,6 +1885,8 @@ class Api:
             t.start()
 
     def _on_menu_loaded(self, window=None):
+        if not self._menu_ok:
+            _boot("menu loaded (메뉴 WebView2 OK)")
         self._menu_ok = True
         if self._config.get("menuResetCount"):
             self._config.update({"menuResetCount": 0})
@@ -1640,11 +1919,21 @@ class Api:
         """메뉴 페이지가 측정한 실제 필요 크기(물리 px)로 창 크기 보정."""
         # 메뉴 페이지 JS→파이썬 호출이 왔다 = 메뉴 창이 확실히 살아 있다
         # (구버전 pywebview 에서 loaded 이벤트 연결이 실패한 경우 대비)
+        if not self._menu_ok:
+            _boot("menu page alive (menu_resize %sx%s)" % (w, h))
         self._menu_ok = True
         try:
             self._menu_w, self._menu_h = int(w), int(h)
             if self._menu is not None and self._menu in webview.windows:
-                self._menu.resize(self._menu_w, self._menu_h)
+                # 물리 px 그대로 적용 — pywebview 6.2+ 의 resize() 는 논리 px 를
+                # 받아 배율을 한 번 더 곱한다
+                u = _user32()
+                mh = self._hwnd_of(self._menu)
+                if u is not None and mh:
+                    u.SetWindowPos(mh, None, 0, 0, self._menu_w, self._menu_h,
+                                   SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE)
+                else:
+                    self._menu.resize(self._menu_w, self._menu_h)
         except Exception:
             pass
 
@@ -1682,6 +1971,18 @@ class Api:
             _log_file("show_menu: menu window unavailable")
             return
         self._menu_open = True
+        _log_file("menu open (menu_ok=%s)" % self._menu_ok)
+        # JS 의 screenX*devicePixelRatio 는 배율이 다른 모니터가 섞이면
+        # (예: 노트북 150% + 외부 모니터 100%) 보조 모니터에서 엉뚱한
+        # 위치가 된다 — 실제 커서 위치(물리 px)가 있으면 그것을 쓴다.
+        try:
+            u = _user32()
+            if u is not None:
+                pt = wintypes.POINT()
+                if u.GetCursorPos(ctypes.byref(pt)):
+                    sx, sy = pt.x, pt.y
+        except Exception:
+            pass
         try:
             x, y = self._menu_pos(int(sx), int(sy))
         except Exception:
@@ -1828,6 +2129,7 @@ class Api:
 
     def menu_action(self, name):
         """팝업 메뉴 항목 실행."""
+        _log_file("menu: %s" % name)
         self.hide_menu()
         page_calls = {
             "play": "window.__mini && __mini.togglePlay()",
@@ -1931,14 +2233,17 @@ class Api:
                 mi_next = ToolStripMenuItem("다음")
                 mi_prev = ToolStripMenuItem("이전")
                 mi_top = ToolStripMenuItem("항상 위 끄기")
+                mi_log = ToolStripMenuItem("로그 저장 (txt)")
                 mi_quit = ToolStripMenuItem("닫기")
                 mi_open.Click += lambda s, e: self._tray_cmd("open")
                 mi_play.Click += lambda s, e: self._tray_cmd("play")
                 mi_next.Click += lambda s, e: self._tray_cmd("next")
                 mi_prev.Click += lambda s, e: self._tray_cmd("prev")
                 mi_top.Click += lambda s, e: self._tray_cmd("ontop")
+                mi_log.Click += lambda s, e: self._tray_cmd("exportlog")
                 mi_quit.Click += lambda s, e: self._tray_cmd("quit")
-                for it in (mi_open, mi_play, mi_next, mi_prev, mi_top, mi_quit):
+                for it in (mi_open, mi_play, mi_next, mi_prev, mi_top, mi_log,
+                           mi_quit):
                     menu.Items.Add(it)
                 self._tray_play_item = mi_play
                 self._tray_ontop_item = mi_top
@@ -1989,6 +2294,8 @@ class Api:
                     self.quit()
                 elif name == "ontop":
                     self.set_on_top(not self._config.get("onTop", True))
+                elif name == "exportlog":
+                    self.export_log()
                 else:
                     if name == "play":
                         self._playing = not self._playing   # 라벨 즉시 반영
@@ -2015,11 +2322,39 @@ class Api:
             u = _user32()
             mh = self._hwnd_of(self._window)
             if u and mh:
+                # 메뉴 '최소화'로 내려간 창은 SWP_SHOWWINDOW 만으로는 안 올라온다
+                if u.IsIconic(mh):
+                    u.ShowWindow(mh, SW_SHOWNOACTIVATE)
                 u.SetWindowPos(mh, HWND_TOPMOST, 0, 0, 0, 0,
                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
                                | SWP_SHOWWINDOW)
         except Exception:
             pass
+
+    def _dispose_notify_icon(self, wait=1.0):
+        """트레이 아이콘 제거 — 만든 UI 스레드에서 해야 확실히 지워진다.
+
+        다른 스레드에서 Dispose 하면 아이콘의 숨은 메시지 창이 정리되지 않아,
+        종료 후에도 마우스를 올리기 전까지 '유령 아이콘'이 트레이에 남는다.
+        """
+        ni = self._notify
+        if ni is None:
+            return
+        self._notify = None
+        done = threading.Event()
+
+        def _do():
+            try:
+                ni.Visible = False
+                ni.Dispose()
+            except Exception:
+                pass
+            finally:
+                done.set()
+
+        if not self._on_ui_thread(_do):
+            _do()
+        done.wait(wait)
 
     def show_logs(self):
         """로그 파일(mini.log)을 보여주는 창. 오류 진단용 인터페이스."""
@@ -2033,11 +2368,26 @@ class Api:
         page = (
             "<!DOCTYPE html><html><head><meta charset='utf-8'><style>"
             "body{background:#111;color:#ddd;font:12px Consolas,monospace;"
-            "padding:10px;white-space:pre-wrap;word-break:break-all;}"
-            "h3{color:#fff;font:13px sans-serif;margin-bottom:8px;}"
-            "</style></head><body><h3>YT Mini 로그 ("
-            + _html.escape(os.path.join(PROFILE_DIR, "mini.log"))
-            + ")</h3>" + _html.escape(text) + "</body></html>"
+            "padding:10px;margin:0;}"
+            "#bar{position:sticky;top:0;background:#111;padding:6px 0 8px;"
+            "border-bottom:1px solid #333;margin-bottom:8px;}"
+            "h3{color:#fff;font:13px sans-serif;margin:0 0 6px;}"
+            "button{font:12px 'Malgun Gothic',sans-serif;background:#ff5252;color:#fff;"
+            "border:0;border-radius:4px;padding:6px 12px;cursor:pointer;}"
+            "#msg{font:12px 'Malgun Gothic',sans-serif;color:#9f9;margin-left:8px;}"
+            "pre{white-space:pre-wrap;word-break:break-all;margin:0;font:inherit;}"
+            "</style></head><body><div id='bar'><h3>YT Mini 로그 ("
+            + _html.escape(LOG_PATH)
+            + ")</h3><button id='exp'>진단 로그 TXT로 저장 (바탕화면)</button>"
+            "<span id='msg'></span></div><pre>" + _html.escape(text) + "</pre>"
+            "<script>"
+            "document.getElementById('exp').onclick=function(){"
+            "var m=document.getElementById('msg');m.textContent='저장 중...';"
+            "if(!(window.pywebview&&pywebview.api)){m.textContent='잠시 후 다시 눌러 주세요';return;}"
+            "pywebview.api.export_log().then(function(p){"
+            "m.textContent=p?('저장됨: '+p+'  — 이 파일을 보내 주세요'):'저장 실패';});};"
+            "window.scrollTo(0,document.body.scrollHeight);"
+            "</script></body></html>"
         )
         if self._logwin is not None and self._logwin in webview.windows:
             try:
@@ -2049,9 +2399,18 @@ class Api:
                 pass
         try:
             self._logwin = webview.create_window(
-                "YT Mini 로그", html=page, width=720, height=480, on_top=False)
+                "YT Mini 로그", html=page, js_api=self, width=720, height=480,
+                on_top=False)
         except Exception as e:
             _log_file("show_logs failed: %r" % (e,))
+
+    def export_log(self):
+        """진단 로그를 바탕화면 txt 로 저장하고 탐색기에서 보여준다.
+        (로그 창 버튼 / 트레이 메뉴 '로그 저장') 저장 경로를 반환."""
+        path = _export_log_txt(reason="사용자 요청")
+        if path:
+            _reveal_in_explorer(path)
+        return path
 
     # ---- 버전 확인 / 수동 업데이트 ----
 
@@ -2136,8 +2495,7 @@ class Api:
         보정이 어긋난다.
         """
         try:
-            mx, my = self._window.x, self._window.y
-            mh = self._window.height
+            mx, my, _mw, mh = self._mini_rect()
             x, y = mx, my + mh + 6
             area = _work_area_at(mx + 10, my + 10)
             if area:
@@ -2213,7 +2571,10 @@ class Api:
         self._open_browser_url(BROWSER_URLS.get(which, BROWSER_URLS["home"]))
 
     def _open_browser_url(self, url):
-        bw, bh = 1000, 650
+        # 1000x650 은 논리 크기 — 배율 150% 화면에서도 같은 체감 크기가 되게
+        # 물리 px 로 환산한다 (배치는 SetWindowPos = 물리 px)
+        scale = _dpi_scale(self._hwnd_of(self._window))
+        bw, bh = int(1000 * scale), int(650 * scale)
         x, y = self._browser_geometry(bw, bh)
         if self._browser is not None and self._browser in webview.windows:
             try:
@@ -2224,14 +2585,16 @@ class Api:
                 return
             except Exception:
                 pass
+        # create_window 의 좌표/크기는 (버전에 따라) 배율이 곱해지는 값이라
+        # 근사치로만 넘기고, 정확한 배치는 _place_browser 가 물리 px 로 한다
         self._browser = webview.create_window(
             "YouTube",
             url=url,
             js_api=self,
-            width=bw,
-            height=bh,
-            x=x,
-            y=y,
+            width=1000,
+            height=650,
+            x=None if x is None else int(x / scale),
+            y=None if y is None else int(y / scale),
             on_top=False,
         )
         # 페이지가 로드될 때마다 클릭 가로채기 스크립트 주입
@@ -2332,9 +2695,12 @@ class Api:
         deadline = time.time() + 45
         last_query = 0.0
         last_rect = None
+        reason = "timeout 45s"
+        last_state = None
         while time.time() < deadline and not self._splash_done:
             try:
                 if self._window not in webview.windows:
+                    reason = "mini window closed"
                     break
             except Exception:
                 pass
@@ -2355,19 +2721,37 @@ class Api:
             if self._engine_ok and (time.time() - last_query) >= 0.3:
                 last_query = time.time()
                 try:
+                    # 상태: 훅 주입 여부 / video 요소 / readyState / 광고 / 오류
                     rr = self._window.evaluate_js(
                         "(function(){try{var v=document.querySelector('video');"
-                        "return (window.__miniHooked===true&&v&&v.readyState>=2)"
-                        "?'1':'0';}catch(e){return '0';}})()")
-                    if rr == "1":
+                        "var p=document.querySelector('#movie_player');"
+                        "return 'hook='+(window.__miniHooked===true?1:0)"
+                        "+' video='+(v?1:0)+' ready='+(v?v.readyState:-1)"
+                        "+' ad='+(p&&p.classList.contains('ad-showing')?1:0)"
+                        "+' err='+(document.querySelector('#movie_player .ytp-error')?1:0)"
+                        "+' host='+location.host+location.pathname;"
+                        "}catch(e){return 'js-error '+e;}})()")
+                    if rr != last_state:          # 바뀔 때만 기록
+                        last_state = rr
+                        _boot("splash wait: %s" % rr)
+                    if rr and "hook=1" in rr and "video=1" in rr and (
+                            "ready=2" in rr or "ready=3" in rr or "ready=4" in rr):
+                        reason = "ready"
                         break
-                except Exception:
-                    pass
+                except Exception as e:
+                    if last_state != "exc":
+                        last_state = "exc"
+                        _boot("splash wait: evaluate_js 실패 %r" % (e,))
             time.sleep(0.12)
+        if self._splash_done:
+            reason = "already hidden"
+        _boot("splash hidden: %s (engine_ok=%s)" % (reason, self._engine_ok))
         self._hide_splash()
 
     def _on_engine_loaded(self, window=None):
         """미니 창 loaded 이벤트: WebView2 정상 표시 + UI 주입."""
+        if not self._engine_ok:
+            _boot("mini loaded (WebView2 OK)")
         self._engine_ok = True
         if self._config.get("udfResetCount"):
             self._config.update({"udfResetCount": 0})
@@ -2398,8 +2782,12 @@ class Api:
                 "__ADFF__",
                 "true" if self._config.get("adFastSkip", True) else "false")
             self._window.evaluate_js(js)
-        except Exception:
-            pass
+        except Exception as e:
+            # 2초마다 재시도하므로 처음 몇 번만 기록
+            n = getattr(self, "_inject_errs", 0) + 1
+            self._inject_errs = n
+            if n <= 3:
+                _log_file("inject mini hook failed (#%d): %r" % (n, e))
 
     def play_in_mini(self, url, title=None):
         """브라우저 창에서 영상 클릭 시: 그 창을 숨기고 미니에서 재생.
@@ -2515,8 +2903,8 @@ def _kernel32_ex():
     return k
 
 
-def _descendant_procs(root_pid):
-    """root_pid 의 모든 하위(자식·손자…) 프로세스를 (pid, exe소문자) 로 반환."""
+def _process_list():
+    """실행 중인 모든 프로세스를 (pid, ppid, exe소문자) 목록으로 반환."""
     k = _kernel32_ex()
     if k is None:
         return []
@@ -2541,6 +2929,12 @@ def _descendant_procs(root_pid):
             k.CloseHandle(snap)
         except Exception:
             pass
+    return procs
+
+
+def _descendant_procs(root_pid):
+    """root_pid 의 모든 하위(자식·손자…) 프로세스를 (pid, exe소문자) 로 반환."""
+    procs = _process_list()
     children = {}
     name_of = {}
     for pid, ppid, name in procs:
@@ -2620,6 +3014,19 @@ def _kill_profile_lockers():
     """
     if not sys.platform.startswith("win"):
         return
+    # PowerShell(+CIM) 기동은 1~3초 걸려 매 실행마다 돌리면 시작이 늦어진다.
+    # 비정상 종료로 남은 WebView2 는 부모(우리 프로세스)가 사라진 '고아'이므로
+    # 그런 msedgewebview2.exe 가 있을 때만 정밀 검사(명령줄 확인)를 한다.
+    try:
+        procs = _process_list()
+        if procs:
+            alive = {pid for pid, _pp, _n in procs}
+            if not any(n == "msedgewebview2.exe" and pp not in alive
+                       for _pid, pp, n in procs):
+                return
+            _boot("고아 WebView2 프로세스 발견 → PowerShell 정리 실행")
+    except Exception:
+        pass
     name = os.path.basename(PROFILE_DIR)         # 예: .yt_mini_profile
     safe = name.replace("'", "''")
     ps = (
@@ -2717,17 +3124,18 @@ def _enable_dpi_awareness():
     try:
         u = ctypes.windll.user32
     except AttributeError:
-        return  # Windows 가 아님
+        return "n/a"  # Windows 가 아님
     try:
         # Per-Monitor v2 (Windows 10 1703+)
         if u.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
-            return
+            return "per-monitor v2"
     except Exception:
         pass
     try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_AWARE
-    except Exception:
-        pass
+        hr = ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_AWARE
+        return "per-monitor v1 (hr=%s)" % hr
+    except Exception as e:
+        return "failed (%r)" % (e,)
 
 
 def _hide_own_console():
@@ -2769,6 +3177,8 @@ def _relaunch():
         pass
     _wait_webview_children_gone()   # 자식 프로세스가 완전히 내려가 프로필 잠금이 풀릴 때까지
     import subprocess
+    _boot("relaunch")
+    os.environ.pop("YTMINI_T0", None)   # 새 프로세스는 자기 시작 시각부터 잰다
     try:
         if getattr(sys, "frozen", False):
             subprocess.Popen([sys.executable])
@@ -2793,6 +3203,9 @@ def _engine_watchdog(api):
     # 더 기다린다 (건강하지만 느린 실행을 오탐으로 날려 재시작 루프에 빠지는
     # 것을 막는다).
     waited = 30
+    if not api._engine_ok:
+        _boot("watchdog: 30초 내 mini loaded 없음 (webview2 자식=%s) → 최대 120초 대기"
+              % _has_webview_children())
     while not api._engine_ok and waited < 120 and _has_webview_children():
         time.sleep(2)
         waited += 2
@@ -2805,23 +3218,28 @@ def _engine_watchdog(api):
             count = int(api._config.get("menuResetCount", 0))
             api._config.update({"menuResetCount": count + 1})
             save_config(api._config)
-            _log_file("engine watchdog: menu window not loaded in 20s"
+            _log_file("engine watchdog: menu window not loaded within 30s"
                       " (relaunch %d/2)" % (count + 1,))
             if count < 2:
                 _relaunch()
         return
-    _log_file("engine watchdog: no loaded event in 20s (WebView2 init failure)")
+    _log_file("engine watchdog: no loaded event within 30~120s (WebView2 init failure)")
     u = _user32()
     if u is None:
         return
     count = int(api._config.get("udfResetCount", 0))
+    # 문제가 난 바로 이 실행의 로그를 자동으로 바탕화면에 남긴다
+    exported = _export_log_txt(reason="WebView2 초기화 실패 (watchdog, %d회째)"
+                               % (count + 1))
+    note = ("\n\n진단 로그를 저장했어요 (개발자에게 보내 주세요):\n" + exported
+            if exported else "")
     if count >= 2:
         try:
             u.MessageBoxW(
                 None,
                 "영상 엔진(WebView2) 초기화가 반복 실패했습니다.\n"
                 "작업 관리자에서 msedgewebview2.exe 를 모두 종료하거나\n"
-                "PC 를 재부팅한 뒤 다시 실행해 주세요.",
+                "PC 를 재부팅한 뒤 다시 실행해 주세요." + note,
                 "YT Mini", 0x30,
             )
         except Exception:
@@ -2833,7 +3251,7 @@ def _engine_watchdog(api):
         u.MessageBoxW(
             None,
             "영상 엔진(WebView2) 초기화에 실패해 프로필을 복구하고 "
-            "다시 시작합니다.\n(유튜브 로그인은 다시 필요할 수 있어요)",
+            "다시 시작합니다.\n(유튜브 로그인은 다시 필요할 수 있어요)" + note,
             "YT Mini", 0x40,
         )
     except Exception:
@@ -2918,6 +3336,7 @@ def _keep_mini_injected(api):
     loaded 이벤트를 놓치거나 주입 스크립트가 실패해도 2초마다 재시도한다.
     스크립트 자체가 __miniHooked 가드로 멱등이라 중복 주입은 무해하다.
     """
+    _boot("GUI 루프 시작 (webview.start 콜백)")
     t = threading.Thread(target=_keep_topmost, args=(api,), daemon=True)
     t.start()
     t2 = threading.Thread(target=_engine_watchdog, args=(api,), daemon=True)
@@ -2948,7 +3367,18 @@ def _keep_mini_injected(api):
             try:
                 mh = api._hwnd_of(api._window)
                 if mh:
+                    _boot("mini hwnd ready: rect=%s dpi=%d%%"
+                          % (_window_rect(mh), round(_dpi_scale(mh) * 100)))
                     _strip_window_chrome(mh)
+                    # 저장된 위치(물리 px)로 정확히 맞춘다 — create_window 에는
+                    # 근사치만 넘겼다 (main 참고). 사용자가 이미 끌었으면 생략.
+                    sp, api._start_pos = api._start_pos, None
+                    u = _user32()
+                    if sp and u is not None and not hasattr(api, "_drag_origin"):
+                        r = _window_rect(mh)
+                        if r and (r[0], r[1]) != sp:
+                            u.SetWindowPos(mh, None, sp[0], sp[1], 0, 0,
+                                           SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
                     ip = _icon_path()
                     if ip:
                         native = getattr(api._window, "native", None)
@@ -2971,7 +3401,9 @@ def _keep_mini_injected(api):
         if not tray_ready and chrome_stripped:
             try:
                 tray_ready = api._ensure_notify_icon()
-            except Exception:
+                _boot("tray icon: %s" % ("ready" if tray_ready else "retry"))
+            except Exception as e:
+                _log_file("tray icon failed: %r" % (e,))
                 tray_ready = True
         # 마지막 시청 영상 + 재생 위치 저장 (파이썬 주도라 예외도 조용히 처리)
         try:
@@ -2999,14 +3431,7 @@ def _keep_mini_injected(api):
         # 위치 폴링 저장 — moved 이벤트가 없는 환경이나 네이티브 드래그
         # (OS 가 직접 이동)에서도 확실히 저장되게 한다. 크기는 저장하지
         # 않는다 — 다음 실행은 항상 기본 크기로 시작한다.
-        try:
-            w = api._window
-            geo = {"x": int(w.x), "y": int(w.y)}
-            if any(api._config.get(k) != v for k, v in geo.items()):
-                api._config.update(geo)
-                api._persist_later()
-        except Exception:
-            pass
+        api._remember_pos()
         time.sleep(2)
 
 
@@ -3160,8 +3585,21 @@ def _pos_on_screen(x, y, w, h):
     return False
 
 
+def _valid_phys_position(cfg):
+    """저장된 물리 px 위치(px/py)를 검증해 (x, y) 또는 None 반환."""
+    try:
+        x, y = int(cfg.get("px")), int(cfg.get("py"))
+    except (TypeError, ValueError):
+        return None
+    s = _dpi_scale()
+    if not _pos_on_screen(x, y, int(BASE_W * s), int(BASE_H * s)):
+        _log_file("저장된 창 위치가 화면 밖이라 자동 배치 (px=%d py=%d)" % (x, y))
+        return None
+    return x, y
+
+
 def _valid_position(cfg):
-    """저장된 창 위치를 검증해 (x, y) 또는 (None, None) 반환.
+    """(구버전 설정) 저장된 x/y 를 검증해 (x, y) 또는 (None, None) 반환.
 
     창 크기는 항상 BASE_W x BASE_H 로 시작하므로(손잡이로 줄인 크기는
     저장하지 않음) 위치만 검증하면 된다. 위치가 완전히 화면 밖이면
@@ -3179,12 +3617,21 @@ def _valid_position(cfg):
 
 
 def main():
+    # 진단 로그: 세션 구분선 + 잡히지 않은 예외 기록. 이후 '[boot]' 줄이
+    # 시작 단계별 체크포인트 — 마지막 '[boot]' 줄이 멈춘 지점이다.
+    _trim_log()
+    _install_crash_logging()
+    _log_file("%s pid=%d version=%s =====" % (SESSION_MARK, os.getpid(), VERSION))
     # 중복 실행이면 종료 — 두 인스턴스가 같은 WebView2 프로필을 잡으면
     # 두 번째가 0x8007139F(컨트롤러 생성 실패)로 흰 창만 뜬다.
     if not _single_instance():
+        _boot("single instance: 기존 실행 유지 → 이 실행 종료")
         return
+    _boot("single instance OK")
     # DPI 인식은 어떤 창보다 먼저 설정해야 한다 (exe 좌표 어긋남 방지)
-    _enable_dpi_awareness()
+    _boot("dpi awareness: %s" % _enable_dpi_awareness())
+    for line in _system_info_lines():
+        _log_file("  " + line)
     # 더블클릭 실행 시 뜨는 콘솔 창 숨김
     _hide_own_console()
     # pywebview 내부 오류도 로그 파일에 수집 — 콘솔 없는 exe 에서도
@@ -3192,17 +3639,17 @@ def main():
     try:
         import logging
         os.makedirs(PROFILE_DIR, exist_ok=True)
-        handler = logging.FileHandler(
-            os.path.join(PROFILE_DIR, "mini.log"), encoding="utf-8")
-        handler.setLevel(logging.WARNING)
-        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s",
-                                               datefmt="%H:%M:%S"))
-        logging.getLogger("pywebview").addHandler(handler)
+        handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+        handler.setLevel(logging.INFO)    # 엔진 선택(Chromium/WinForms) 등도 기록
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s.%(msecs)03d [pywebview] %(levelname)s %(message)s",
+            datefmt="%m-%d %H:%M:%S"))
+        lg = logging.getLogger("pywebview")
+        lg.addHandler(handler)
+        if lg.getEffectiveLevel() > logging.INFO:
+            lg.setLevel(logging.INFO)
     except Exception:
         pass
-    _log_file("YT Mini 시작 — version %s (frozen=%s, updated=%s)"
-              % (VERSION, getattr(sys, "frozen", False),
-                 bool(os.environ.get("YTMINI_RUNNING_UPDATE"))))
     # 최신본은 백그라운드로 받아 '다음 실행'에 적용 — 시작이 느려지지 않게
     threading.Thread(target=_background_update_fetch, daemon=True).start()
     # ARM Windows(에뮬레이션 실행)에서 win-arm64 인터롭 DLL 을 못 찾아
@@ -3210,6 +3657,12 @@ def main():
     _patch_pywebview_arch()
 
     cfg = load_config()
+    _boot("config loaded: onTop=%s opacity=%s gpuCompositing=%s resetUdf=%s "
+          "udfResetCount=%s menuResetCount=%s px/py=%s,%s"
+          % (cfg.get("onTop", True), cfg.get("opacity", 100),
+             cfg.get("gpuCompositing", False), cfg.get("resetUdf", False),
+             cfg.get("udfResetCount", 0), cfg.get("menuResetCount", 0),
+             cfg.get("px"), cfg.get("py")))
     # WebView2 실행 플래그 — 엔진이 뜨기 전(webview.start 전)에 정해야 한다.
     #  - autoplay-policy: 사용자 클릭 없이도 소리 있는 자동재생 허용
     #  - disable-gpu-compositing: 불투명도를 쓰려면 필수.
@@ -3241,6 +3694,7 @@ def main():
     # 먼저 정리 — 이게 남아 있으면 이번 실행의 엔진 초기화도 실패해
     # '프로필 복구 후 재시작'이 반복된다. (우리 WebView2 가 뜨기 전에 호출)
     _kill_profile_lockers()
+    _boot("profile locker check done")
     # 지난 실행에서 엔진 초기화 실패로 프로필 복구가 예약된 경우:
     # 이전 프로세스(웹뷰 포함)가 완전히 내려간 뒤 엔진 데이터만 삭제.
     # 이전 인스턴스의 WebView2 자식이 늦게 내려가 프로필이 잠겨 있으면
@@ -3268,14 +3722,27 @@ def main():
     # 않는다(창을 아주 작게 줄인 채로 재시작하면 로딩 중 레이아웃이 깨져
     # 보이는 문제가 있었다). 위치만 저장된 값을 검증해 사용한다.
     win_w, win_h = BASE_W, BASE_H
-    win_x, win_y = _valid_position(cfg)
+    start_pos = _valid_phys_position(cfg)
+    if start_pos is not None:
+        # create_window 의 x/y 는 pywebview 가 배율을 곱하는 값이라 물리 px 를
+        # 배율로 나눈 근사치를 넘기고, 창 핸들이 생기면 정확히 맞춘다
+        s = _dpi_scale()
+        win_x, win_y = int(round(start_pos[0] / s)), int(round(start_pos[1] / s))
+    else:
+        cfg.pop("px", None)
+        cfg.pop("py", None)
+        win_x, win_y = _valid_position(cfg)
     if win_x is None:
         cfg.pop("x", None)
         cfg.pop("y", None)
-    else:
+    elif start_pos is None:
         cfg["x"], cfg["y"] = win_x, win_y
 
+    _boot("start position: phys=%s create_xy=%s,%s url=%s"
+          % (start_pos, win_x, win_y,
+             "lastUrl" if cfg.get("lastUrl") else "default"))
     api = Api(cfg)
+    api._start_pos = start_pos
     window = webview.create_window(
         "YT Mini",
         url=start_url,
@@ -3293,9 +3760,11 @@ def main():
         easy_drag=False,
     )
     api._window = window
+    _boot("mini window created")
     # 팝업 메뉴 창은 반드시 시작 전에 생성 (화면 밖 좌표라 보이지 않음).
     # 실행 중 생성은 WebView2 초기화가 꼬여 드래그까지 죽는 사고가 있었다.
     api._ensure_menu()
+    _boot("menu window created: %s" % (api._menu is not None))
     # 시청 페이지가 로드될 때마다 미니 UI(CSS/실드/손잡이) 주입
     # (+ loaded 수신 = WebView2 정상이라는 신호로 워치독에 사용)
     try:
@@ -3312,13 +3781,33 @@ def main():
 
     # 로그인 세션(쿠키)을 유지해 홈/구독 창에서 한 번 로그인하면 계속 사용.
     os.makedirs(PROFILE_DIR, exist_ok=True)
-    webview.start(_keep_mini_injected, (api,), private_mode=False, storage_path=PROFILE_DIR)
+    _boot("webview.start 호출 (WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=%s)"
+          % os.environ.get("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"))
+    try:
+        webview.start(_keep_mini_injected, (api,), private_mode=False,
+                      storage_path=PROFILE_DIR)
+    except Exception:
+        # 기록만 하고 그대로 전파 — 캐시된 업데이트가 여기서 죽으면
+        # _run_cached_update_if_any 가 받아 번들 버전으로 되돌린다
+        import traceback
+        _log_file("webview.start 예외: %s" % traceback.format_exc().rstrip())
+        raise
+    _boot("GUI 루프 종료 (engine_ok=%s menu_ok=%s)" % (api._engine_ok, api._menu_ok))
 
     # GUI 루프 종료(모든 창 닫힘) 후: 남은 백그라운드 스레드와 무관하게
     # 프로세스를 확실히 종료해 좀비(뮤텍스 잔류 → '이미 실행 중' 팝업) 방지.
     # 종료 전 WebView2 자식을 정리해 _MEI 임시폴더 삭제 실패 경고를 막는다.
     try:
         save_config(api._config)
+    except Exception:
+        pass
+    # 여기는 메인(=UI) 스레드라 트레이 아이콘을 직접 지울 수 있다
+    # (작업표시줄 닫기 등 quit() 을 거치지 않은 종료 경로)
+    try:
+        ni, api._notify = api._notify, None
+        if ni is not None:
+            ni.Visible = False
+            ni.Dispose()
     except Exception:
         pass
     _kill_descendants()
