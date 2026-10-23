@@ -67,7 +67,7 @@ from ctypes import wintypes
 
 # 배포 버전. 새 코드를 main 브랜치에 올릴 때마다 반드시 올려야(증가) 자동
 # 업데이트가 인식한다. 형식은 자유지만 숫자가 커지는 방향으로.
-VERSION = "2026.10.23.2"
+VERSION = "2026.10.23.3"
 
 # 자동 업데이트 소스 — main 브랜치의 youtube_mini.py (raw, 공개 접근).
 # 사용자에게 배포하려면 변경사항을 main 에 병합/푸시하고 VERSION 을 올린다.
@@ -101,6 +101,25 @@ def _upd_log(msg):
             f.write(_log_stamp() + " [update] " + str(msg) + "\n")
     except Exception:
         pass
+
+
+def _independent_env(env=None):
+    """자기 자신을 새로 띄울 때(재시작) 쓸 환경변수.
+
+    PyInstaller onefile 은 sys.executable 로 띄운 자식을 '보조 프로세스'로
+    보고 부모의 임시폴더(_MEIxxxx)를 그대로 쓰게 한다. 재시작처럼 자식이
+    부모보다 오래 살면, 부모가 종료하며 그 폴더를 지우는 동안 자식이 파일을
+    쓰고 있어 (1) 'Failed to remove temporary directory' 경고가 뜨고
+    (2) 지워진 파일 때문에 새 실행의 WebView2 초기화가 실패한다.
+    PYINSTALLER_RESET_ENVIRONMENT=1(6.9+ 공식 방법)로 독립 실행시키고,
+    구버전 부트로더가 보는 내부 변수(_MEIPASS2, _PYI_*)도 지운다.
+    """
+    env = dict(os.environ if env is None else env)
+    for k in list(env):
+        if k == "_MEIPASS2" or k.startswith("_PYI_"):
+            env.pop(k, None)
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return env
 
 
 def _upd_version_of(src):
@@ -182,7 +201,7 @@ def _run_cached_update_if_any():
                 pass
             try:
                 import subprocess
-                env = dict(os.environ)
+                env = _independent_env()
                 env["YTMINI_NOUPDATE"] = "1"
                 env.pop("YTMINI_RUNNING_UPDATE", None)
                 env.pop("YTMINI_T0", None)
@@ -3181,7 +3200,7 @@ def _relaunch():
     os.environ.pop("YTMINI_T0", None)   # 새 프로세스는 자기 시작 시각부터 잰다
     try:
         if getattr(sys, "frozen", False):
-            subprocess.Popen([sys.executable])
+            subprocess.Popen([sys.executable], env=_independent_env())
         else:
             subprocess.Popen([sys.executable, os.path.abspath(__file__)])
     except Exception:
